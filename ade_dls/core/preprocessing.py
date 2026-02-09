@@ -28,81 +28,122 @@ def get_folder_name(filepath):
 
 #function for base-data extraction
 def extract_data(file_path):
-    #handling of encoding issues
-  encodings = ['utf-8', 'latin-1', 'windows-1252', 'ISO-8859-1']
-  
-  for encoding in encodings:
-    try:
-      with open(file_path, 'r', encoding=encoding) as file:
-        lines = file.readlines()
-        
-        #extract angle
-        angle = None
-        for line in lines:
-          if "Angle [°]       :" in line: 
-            try:
-              angle = float(line.split(":")[1].strip()) 
-              break 
-            except (ValueError, IndexError):
-              print(f"Error extracting angle from {file_path}")
+    """
+    Extract base data from .asc file with robust error handling
 
-        #extract temperature
-        temperature = None
-        for line in lines:
-          if "Temperature [K] :" in line: 
-            try:
-              temperature = float(line.split(":")[1].strip()) 
-              break 
-            except (ValueError, IndexError):
-              print(f"Error extracting temperature from {file_path}")
-              
-        #extract wavelength
-        wavelength = None
-        for line in lines:
-          if "Wavelength [nm] :" in line:
-            try:
-              wavelength = float(line.split(":")[1].strip())
-              break  # Exit the loop after finding the wavelength
-            except (ValueError, IndexError):
-              print(f"Error extracting wavelength from {file_path}")
+    Args:
+        file_path: Path to .asc file
 
-        #extract refractive index
-        refractive_index = None
-        for line in lines:
-          if "Refractive Index:" in line: 
-            try:
-              refractive_index = float(line.split(":")[1].strip()) 
-              break 
-            except (ValueError, IndexError):
-              print(f"Error extracting refractive index from {file_path}")
+    Returns:
+        pd.DataFrame with extracted data or None on error
+    """
+    # Handling of encoding issues
+    encodings = ['utf-8', 'latin-1', 'windows-1252', 'ISO-8859-1']
 
-        #extract viscosity
-        viscosity = None
-        for line in lines:
-          if "Viscosity [cp]  :" in line: 
-            try:
-              viscosity = float(line.split(":")[1].strip()) 
-              break 
-            except (ValueError, IndexError):
-              print(f"Error extracting viscosity from {file_path}")
+    for encoding_idx, encoding in enumerate(encodings):
+        try:
+            # Initialize data dictionary
+            data = {
+                'angle [°]': [None],
+                'temperature [K]': [None],
+                'wavelength [nm]': [None],
+                'refractive_index': [None],
+                'viscosity [cp]': [None]
+            }
 
-        #create DataFrame
-        data = {'angle [°]': [angle], 'temperature [K]': [temperature], 'wavelength [nm]': [wavelength], 
-                'refractive_index': [refractive_index], 'viscosity [cp]': [viscosity]}
-        return pd.DataFrame(data)
-      
-    except UnicodeDecodeError:
-      #this encoding doesn't work, try the next one
-      if encoding == encodings[-1]:
-        print(f"Failed to decode {file_path} with all attempted encodings")
-        return None
-      continue
-    except FileNotFoundError as e:
-      print(f"File not found: {file_path}. Error: {e}")
-      return None
-    except Exception as e:
-      print(f"An error occurred while processing {file_path}: {e}")
-      return None
+            # Read file line by line (memory efficient)
+            # Only read first 200 lines (metadata is always at the top)
+            with open(file_path, 'r', encoding=encoding, errors='replace') as file:
+                for line_num, line in enumerate(file):
+                    # Stop after 200 lines (all metadata should be found by then)
+                    if line_num > 200:
+                        break
+
+                    try:
+                        # Extract angle
+                        if data['angle [°]'][0] is None and "Angle [°]       :" in line:
+                            try:
+                                data['angle [°]'][0] = float(line.split(":")[1].strip())
+                            except (ValueError, IndexError):
+                                pass  # Continue to next field
+
+                        # Extract temperature
+                        elif data['temperature [K]'][0] is None and "Temperature [K] :" in line:
+                            try:
+                                data['temperature [K]'][0] = float(line.split(":")[1].strip())
+                            except (ValueError, IndexError):
+                                pass
+
+                        # Extract wavelength
+                        elif data['wavelength [nm]'][0] is None and "Wavelength [nm] :" in line:
+                            try:
+                                data['wavelength [nm]'][0] = float(line.split(":")[1].strip())
+                            except (ValueError, IndexError):
+                                pass
+
+                        # Extract refractive index
+                        elif data['refractive_index'][0] is None and "Refractive Index:" in line:
+                            try:
+                                data['refractive_index'][0] = float(line.split(":")[1].strip())
+                            except (ValueError, IndexError):
+                                pass
+
+                        # Extract viscosity
+                        elif data['viscosity [cp]'][0] is None and "Viscosity [cp]  :" in line:
+                            try:
+                                data['viscosity [cp]'][0] = float(line.split(":")[1].strip())
+                            except (ValueError, IndexError):
+                                pass
+
+                        # Early exit if all data found
+                        if all(v[0] is not None for v in data.values()):
+                            break
+
+                    except Exception as line_error:
+                        # Skip problematic lines
+                        continue
+
+            # Verify we got ALL required data (not just some)
+            # All fields must be present for valid DLS analysis
+            if any(v[0] is None for v in data.values()):
+                missing_fields = [k for k, v in data.items() if v[0] is None]
+                if encoding_idx == len(encodings) - 1:
+                    print(f"WARNING: Incomplete metadata in {os.path.basename(file_path)}")
+                    print(f"         Missing fields: {', '.join(missing_fields)}")
+                    return None
+                else:
+                    continue  # Try next encoding
+
+            # Successfully extracted complete data, return DataFrame
+            return pd.DataFrame(data)
+
+        except UnicodeDecodeError:
+            # This encoding doesn't work, try the next one
+            if encoding_idx == len(encodings) - 1:
+                print(f"ERROR: Failed to decode {os.path.basename(file_path)} with all encodings")
+                return None
+            continue
+
+        except MemoryError:
+            print(f"ERROR: Out of memory while processing {os.path.basename(file_path)}")
+            return None
+
+        except FileNotFoundError:
+            print(f"ERROR: File not found: {os.path.basename(file_path)}")
+            return None
+
+        except PermissionError:
+            print(f"ERROR: Permission denied: {os.path.basename(file_path)}")
+            return None
+
+        except Exception as e:
+            print(f"ERROR: Unexpected error processing {os.path.basename(file_path)}: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    # Should never reach here
+    return None
 
 
 #function to extract countrate

@@ -150,15 +150,26 @@ def calculate_cumulant_results_A(A_diff, cumulant_method_A_diff, polydispersity_
     pdi_values = [None, polydispersity_method_A_2, polydispersity_method_A_3]
 
     for i, order in enumerate(orders):
-        result = pd.DataFrame()
-        result['Rh [nm]'] = c * (1 / A_diff['D [m^2/s]'][i]) * 10**9
+        # Calculate values as scalars
+        rh_value = c * (1 / A_diff['D [m^2/s]'][i]) * 10**9
         fractional_error_Rh = np.sqrt((delta_c / c)**2 + (A_diff['std err D [m^2/s]'][i] / A_diff['D [m^2/s]'][i])**2)
-        result['Rh error [nm]'] = fractional_error_Rh * result['Rh [nm]']
-        result['R_squared'] = cumulant_method_A_diff['R_squared'][i]
-        result['Fit'] = f'Rh from {order}st order cumulant fit' if order == 1 else f'Rh from {order}nd order cumulant fit' if order == 2 else f'Rh from {order}rd order cumulant fit'
-        result['Residuals'] = cumulant_method_A_diff['Normality'][i]
-        if i > 0: #PDI is only for 2nd and 3rd order
-            result['PDI'] = pdi_values[i]
+        rh_error_value = fractional_error_Rh * rh_value
+        r2_value = cumulant_method_A_diff['R_squared'][i]
+        fit_name = f'Rh from {order}st order cumulant fit' if order == 1 else f'Rh from {order}nd order cumulant fit' if order == 2 else f'Rh from {order}rd order cumulant fit'
+        normality_value = cumulant_method_A_diff['Normality'][i]
+
+        # Create DataFrame with lists to ensure rows are created
+        result = pd.DataFrame({
+            'Rh [nm]': [rh_value],
+            'Rh error [nm]': [rh_error_value],
+            'R_squared': [r2_value],
+            'Fit': [fit_name],
+            'Residuals': [normality_value]
+        })
+
+        if i > 0:  # PDI is only for 2nd and 3rd order
+            result['PDI'] = [pdi_values[i]]
+
         results.append(result)
 
     df_cumulant_method_A_results = pd.concat(results, ignore_index=True)
@@ -214,7 +225,7 @@ def calculate_g2_B(dataframes_dict):
 
 
 #plot Gamma vs. q^2
-def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_names=None, gamma_unit='1/s', x_range=None):
+def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_names=None, gamma_unit='1/s', x_range=None, show_plots=True):
     #validate inputs
     if not isinstance(gamma_cols, list):
         gamma_cols = [gamma_cols]
@@ -254,11 +265,12 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
         if x_range is not None:
             if not isinstance(x_range, (tuple, list)) or len(x_range) != 2:
                 raise ValueError("x_range must be a tuple or list of length 2: (min_x, max_x)")
-            
+
             min_x, max_x = x_range
             mask = (X_full >= min_x) & (X_full <= max_x)
-            X_fit = X_full[mask]
-            Y_fit = Y_full[mask]
+            # Reset index to avoid alignment issues with boolean indexing
+            X_fit = X_full[mask].reset_index(drop=True)
+            Y_fit = Y_full[mask].reset_index(drop=True)
             
             if len(X_fit) < 2:
                 print(f"Warning: Only {len(X_fit)} data points in specified x_range for {gamma_col}. Need at least 2 points for fitting.")
@@ -346,17 +358,20 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
         all_results.append(results_dict)
         
         #set labels and title
-        plt.xlabel('q$^2$ [nm$^{-2}$]')
-        plt.ylabel(f'$\Gamma$ [{gamma_unit}]')
-        
-        title = 'q$^2$ vs. $\Gamma$'
+        plt.xlabel(r'q$^2$ [nm$^{-2}$]')
+        plt.ylabel(fr'$\Gamma$ [{gamma_unit}]')
+
+        title = r'q$^2$ vs. $\Gamma$'
         if method_name:
             title += f' ({method_name})'
         plt.title(title)
         
         plt.legend()
         plt.grid(True)
-        plt.show()
+        if show_plots:
+            plt.show()
+        else:
+            plt.close()
     
     #create dataframe with results
     if not all_results:

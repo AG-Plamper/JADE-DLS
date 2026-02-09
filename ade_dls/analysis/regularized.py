@@ -20,6 +20,60 @@ from scipy import stats
 from matplotlib import cm
 import random
 
+
+def calculate_peak_centroid(decay_times, distribution, peak_index, peak_properties=None, width_factor=3.0):
+    """
+    Calculate the centroid (center of mass) of a peak in log-space
+
+    Args:
+        decay_times: Array of decay time values (x-axis)
+        distribution: Array of distribution values (y-axis, intensities)
+        peak_index: Index of the peak maximum
+        peak_properties: Optional dict from find_peaks with 'widths' info
+        width_factor: How many widths around peak to include (default: 3.0 for ~full peak)
+
+    Returns:
+        Centroid tau value
+    """
+    # Determine the range around the peak to consider
+    n_points = len(decay_times)
+
+    if peak_properties and 'widths' in peak_properties and len(peak_properties['widths']) > 0:
+        # Use peak width from find_peaks
+        width_idx = np.where(peak_properties == peak_index)[0]
+        if len(width_idx) > 0:
+            width = peak_properties['widths'][width_idx[0]]
+            half_width = int(width * width_factor / 2)
+        else:
+            # Fallback: use 10% of total range
+            half_width = max(1, n_points // 10)
+    else:
+        # Fallback: use 10% of total range
+        half_width = max(1, n_points // 10)
+
+    # Define range around peak
+    left = max(0, peak_index - half_width)
+    right = min(n_points, peak_index + half_width + 1)
+
+    # Extract local region
+    local_times = decay_times[left:right]
+    local_dist = distribution[left:right]
+
+    # Calculate centroid in log-space (since decay_times are log-spaced)
+    # Centroid = sum(x * f(x)) / sum(f(x))
+    log_times = np.log10(local_times)
+    total_intensity = np.sum(local_dist)
+
+    if total_intensity > 0:
+        log_centroid = np.sum(log_times * local_dist) / total_intensity
+        centroid = 10 ** log_centroid
+    else:
+        # Fallback to maximum if something goes wrong
+        centroid = decay_times[peak_index]
+
+    return centroid
+
+
 #code for simple NNLS-Fit to the data
 def nnls(df, name, nnls_params, plot_number):
     decay_times = nnls_params['decay_times']
@@ -54,14 +108,17 @@ def nnls(df, name, nnls_params, plot_number):
     optimized_values = (T @ f_optimized)**2
     residuals_values = optimized_values - D
     
-    #find peaks in the tau distribution
-    peaks, _ = find_peaks(f_optimized, prominence=prominence, distance=distance)
-    
+    #find peaks in the tau distribution (with width info for centroid calculation)
+    peaks, peak_properties = find_peaks(f_optimized, prominence=prominence, distance=distance, width=0)
+
     #get peak amplitudes/intensities
     peak_amplitudes = f_optimized[peaks]
-    
+
     #normalization to the total sum
     normalized_amplitudes_sum = peak_amplitudes / np.sum(peak_amplitudes)
+
+    # Check if centroid mode is enabled
+    use_centroid = nnls_params.get('use_centroid', False)
     
     #create plot for this dataframe
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
@@ -104,7 +161,14 @@ def nnls(df, name, nnls_params, plot_number):
     results = {'filename': name}
     for i, peak_index in enumerate(peaks):
         percentage = normalized_amplitudes_sum[i] * 100
-        results[f'tau_{i+1}'] = decay_times[peak_index]
+
+        # Calculate tau value: use centroid or maximum
+        if use_centroid:
+            tau_value = calculate_peak_centroid(decay_times, f_optimized, peak_index, peak_properties)
+        else:
+            tau_value = decay_times[peak_index]
+
+        results[f'tau_{i+1}'] = tau_value
         results[f'intensity_{i+1}'] = f_optimized[peak_index]
         results[f'normalized_sum_percent_{i+1}'] = percentage
 
@@ -273,12 +337,15 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     
     #find peaks
     peaks, peak_properties = find_peaks(f_optimized, prominence=prominence, distance=distance, width=0)
-     
+
     #get peak amplitudes/intensities
     peak_amplitudes = f_optimized[peaks]
-    
+
     #calculate normalized amplitudes
     normalized_amplitudes_sum = peak_amplitudes / np.sum(peak_amplitudes) if np.sum(peak_amplitudes) > 0 else np.zeros_like(peak_amplitudes)
+
+    # Check if centroid mode is enabled
+    use_centroid = nnls_reg_params.get('use_centroid', False)
     
     #enhanced peak analysis for normalized distributions
     peak_stats = {}
@@ -467,10 +534,17 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     for i, peak_index in enumerate(peaks):
         #basic peak metrics
         percentage = normalized_amplitudes_sum[i] * 100
-        results[f'tau_{i+1}'] = decay_times[peak_index]
+
+        # Calculate tau value: use centroid or maximum
+        if use_centroid:
+            tau_value = calculate_peak_centroid(decay_times, f_optimized, peak_index, peak_properties)
+        else:
+            tau_value = decay_times[peak_index]
+
+        results[f'tau_{i+1}'] = tau_value
         results[f'intensity_{i+1}'] = f_optimized[peak_index]
         results[f'normalized_sum_percent_{i+1}'] = percentage
-        
+
         #additional peak metrics if normalize is True
         if normalize and f'peak_{i+1}' in peak_stats:
             peak_info = peak_stats[f'peak_{i+1}']
@@ -573,14 +647,23 @@ def nnls_reg_simple(df, name, nnls_reg_params):
     residuals_values = optimized_values - D
     
     #find peaks
-    peaks, _ = find_peaks(f_optimized, prominence=prominence, distance=distance, width=0)
-    
+    peaks, peak_properties = find_peaks(f_optimized, prominence=prominence, distance=distance, width=0)
+
+    # Check if centroid mode is enabled
+    use_centroid = nnls_reg_params.get('use_centroid', False)
+
     #prepare results for this dataframe
     results = {'filename': name}
     for i, peak_index in enumerate(peaks):
-        results[f'tau_{i+1}'] = decay_times[peak_index]
+        # Calculate tau value: use centroid or maximum
+        if use_centroid:
+            tau_value = calculate_peak_centroid(decay_times, f_optimized, peak_index, peak_properties)
+        else:
+            tau_value = decay_times[peak_index]
+
+        results[f'tau_{i+1}'] = tau_value
         results[f'intensity_{i+1}'] = f_optimized[peak_index]
-    
+
     return results, f_optimized, optimized_values, residuals_values, peaks
 
 #comparing alpha-values

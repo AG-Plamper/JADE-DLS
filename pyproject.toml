@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ade-dls"
+version = "2.0.0"
+description = "Angular Dependent Evaluator for Dynamic Light Scattering - A comprehensive tool for DLS data analysis"
+readme = "README.md"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+maintainers = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+license = {text = "GPL-3.0-or-later"}
+keywords = [
+    "dynamic light scattering",
+    "DLS",
+    "particle size",
+    "hydrodynamic radius",
+    "correlation function",
+    "cumulant analysis",
+    "inverse Laplace transform",
+    "NNLS",
+    "scientific computing"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.22.0",
+    "scipy>=1.8.0",
+    "pandas>=1.5.0",
+    "matplotlib>=3.5.0",
+    "scikit-learn>=1.0.0",
+    "statsmodels>=0.13.0",
+    "joblib>=1.2.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PyQt5>=5.15.0",
+    "nbformat>=5.1.0",
+    "jupyter>=1.0.0",
+    "ipywidgets>=7.6.0",
+]
+export = [
+    "openpyxl>=3.0.0",
+    "xlsxwriter>=3.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+all = [
+    "ade-dls[gui,export]",
+]
+
+[project.urls]
+Homepage = "https://github.com/traianuschem/JADE-DLS"
+Repository = "https://github.com/traianuschem/JADE-DLS"
+Documentation = "https://github.com/traianuschem/JADE-DLS/blob/main/README.md"
+"Bug Tracker" = "https://github.com/traianuschem/JADE-DLS/issues"
+Changelog = "https://github.com/traianuschem/JADE-DLS/blob/main/CHANGELOG.md"
+
+[project.scripts]
+ade-dls = "ade_dls.gui.main_window:main"
+
+[tool.setuptools]
+packages = ["ade_dls"]
+
+[tool.setuptools.package-data]
+ade_dls = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
