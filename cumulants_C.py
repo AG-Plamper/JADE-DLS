@@ -1,10 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Aug  6 11:41:12 2025
+cumulants_C.py
+==============
+Cumulant analysis — Method C: iterative multi-start nonlinear fitting
+of the full autocorrelation function g²(τ) with adaptive initial parameter
+estimation.
 
-@author: vinci
+Functions
+---------
+get_meaningful_parameters(fit_function, full_parameter_list)
+    Filter the parameter list of a fit function to retain only those
+    parameters that appear in its signature.
 
-cumulant analysis: method C
+estimate_parameters_from_data(x_data, y_data, base_parameters)
+    Estimate initial fit parameters directly from correlation data
+    (amplitude from intercept, decay rate from half-life).
+
+get_adaptive_parameters_strategy(dataframes_dict, fit_function, ...)
+    Dispatcher: selects individual, global or representative strategy
+    for adaptive initial parameter estimation.
+
+_individual_strategy(...)
+    Estimate initial parameters independently per correlation file.
+
+_global_strategy(...)
+    Estimate initial parameters from all files pooled together.
+
+_representative_strategy(...)
+    Estimate initial parameters from a representative subset of files.
+
+get_adaptive_initial_parameters(dataframes_dict, fit_function, ...)
+    Top-level function returning a dict of initial guesses per file.
+
+plot_processed_correlations_iterative(dataframes_dict, fit_function2, ...)
+    Iterative curve_fit with multiple random starts, 3-panel diagnostic
+    plot (data+fit | residuals | Q-Q), best-iteration selection by R^2.
+
+Dependencies: numpy, pandas, scipy, matplotlib
 """
 import numpy as np
 from scipy.optimize import curve_fit
@@ -20,7 +52,9 @@ def get_meaningful_parameters(fit_function, full_parameter_list):
     
     func_name = fit_function.__name__
     
-    if func_name == 'fit_function2':
+    if func_name == 'fit_function1':
+        return [a, b, f]
+    elif func_name == 'fit_function2':
         return [a, b, c, f]
     elif func_name == 'fit_function3':  
         return [a, b, c, d, f]
@@ -139,7 +173,7 @@ def estimate_parameters_from_data(x_data, y_data, base_parameters):
 
 #different approaches for adaptive fitting
 def get_adaptive_parameters_strategy(dataframes_dict, fit_function, base_parameters, 
-                                   strategy='individual', x_col='t (s)', y_col='g(2)'):
+                                   strategy='individual', x_col='t [s]', y_col='g(2)-1'):
     
     if strategy == 'individual':
         return _individual_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col)
@@ -242,7 +276,7 @@ def _representative_strategy(dataframes_dict, fit_function, base_parameters, x_c
 
 #convenience wrapper function for easy integration
 def get_adaptive_initial_parameters(dataframes_dict, fit_function, base_parameters, 
-                                  strategy='individual', x_col='t (s)', y_col='g(2)', 
+                                  strategy='individual', x_col='t [s]', y_col='g(2)-1', 
                                   verbose=True):
     if verbose:
         print(f"Using '{strategy}' strategy for parameter adaptation...")
@@ -266,15 +300,15 @@ def get_adaptive_initial_parameters(dataframes_dict, fit_function, base_paramete
 #fit and plot for cumulant-method C
 def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_limits, initial_guesses, 
                                          max_iterations=10, tolerance=1e-4, maxfev=50000, 
-                                         method='lm'):
+                                         method='lm', plot_number_start=1):
     all_fit_results = []
-    plot_number = 1
+    plot_number = plot_number_start
 
     for name, df in dataframes_dict.items():
         fit_result = {'filename': name}
         try:
-            x_data = df['t (s)']
-            y_data = df['g(2)']
+            x_data = df['t [s]']
+            y_data = df['g(2)-1']
 
             x_fit = x_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
             y_fit = y_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
@@ -383,55 +417,54 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
                             fit_result['err_' + param_name] = err_value.item()
                         else:
                             fit_result['err_' + param_name] = err_value
-
+    
             all_fit_results.append(fit_result)
             
             #calculate residuals for the best fit for Q-Q plot
             best_y_fit_values_in_range = fit_function2(x_fit, *best_popt)
             best_residuals = y_fit - best_y_fit_values_in_range
 
-            #horizontal subplot layout
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-            
-            #left plot: Original data and fit iterations
-            ax1.plot(x_data, y_data, marker='.', linestyle='', label='Data')
-            
-            #plot all iterations with increasing opacity
+            #3-panel layout: data+fit | residuals | Q-Q
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+            fig.suptitle(f'[{plot_number}]: Method C ({fit_function2.__name__}) — {name}', fontsize=12)
+
+            #panel 1: data + fit iterations
+            ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')
             for i, (popt, y_fit_values) in enumerate(all_y_fits):
                 if i == best_iteration_index:
-                    #highlight the best fit
-                    ax1.plot(x_data, y_fit_values, 'r-', linewidth=2, 
-                             label=f'Best Fit (Iter {i+1})')
+                    ax1.plot(x_data, y_fit_values, 'r-', linewidth=2,
+                             label=f'Best fit (iter {best_iteration})')
                 else:
-                    #plot other iterations with lower opacity
                     opacity = 0.3 + 0.5 * (i / len(all_y_fits))
-                    ax1.plot(x_data, y_fit_values, '-', alpha=opacity, 
+                    ax1.plot(x_data, y_fit_values, '-', alpha=opacity,
                              color='gray', linewidth=1)
-            
-            ax1.set_xlabel(r"lag time [s]")
-            ax1.set_ylabel('g(2)-1')
-            ax1.set_title(f'[{plot_number}]: g(2)-1 vs. lag time for {name}')
-            ax1.grid(True)
-            ax1.set_xscale('log') 
-            ax1.set_xlim(0, 10)
+            ax1.set_xlabel(r'lag time τ [s]')
+            ax1.set_ylabel(r'$g^{(2)}(\tau) - 1$')
+            ax1.set_title('Data & Fit')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xscale('log')
+            ax1.set_xlim(1e-6, 10)
             ax1.legend()
-            
-            #right plot: Q-Q plot for the best fit
-            stats.probplot(best_residuals, dist="norm", plot=ax2)
-            ax2.set_title(f'[{plot_number}]: Q-Q Plot of Residuals (Best Fit: Iter {best_iteration})')
-            ax2.grid(True)
-            
-            #add parameters of best fit as text
-            param_text = f"Best Fit (Iteration {best_iteration}):\n"
-            param_text += f"R² = {all_r_squared[best_iteration_index]:.4f}\n"
-            param_text += f"RMSE = {all_rmse[best_iteration_index]:.4e}\n"
-            param_text += f"AIC = {all_aic[best_iteration_index]:.2f}"
-            
-            #position the text
-            ax1.text(0.95, 0.95, param_text, transform=ax1.transAxes, 
-                    verticalalignment='top', horizontalalignment='right',
+            param_text = (f"iter {best_iteration}\n"
+                          f"R² = {all_r_squared[best_iteration_index]:.4f}\n"
+                          f"⟨Γ⟩ = {best_popt[1]:.3e} s⁻¹")
+            ax1.text(0.95, 0.95, param_text, transform=ax1.transAxes,
+                    va='top', ha='right',
                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-            
+
+            #panel 2: residuals
+            ax2.plot(best_residuals)
+            ax2.axhline(0, color='r', linestyle='--', linewidth=1)
+            ax2.set_xlabel('Sample Index')
+            ax2.set_ylabel('Residuals')
+            ax2.set_title('Residuals')
+            ax2.grid(True, alpha=0.3)
+
+            #panel 3: Q-Q
+            stats.probplot(best_residuals, dist="norm", plot=ax3)
+            ax3.set_title('Q-Q Plot')
+            ax3.grid(True, alpha=0.3)
+
             plt.tight_layout()
             plt.show()
             plot_number += 1
@@ -443,24 +476,3 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
 
     final_results_df = pd.DataFrame(all_fit_results)
     return final_results_df
-
-#calculate mean fit metrics to compare different fit methods
-def calculate_mean_fit_metrics(results_df):
-    #filter out rows with errors
-    valid_results = results_df[~results_df['filename'].str.contains('Error', na=False)]
-    
-    #calculate means of "best fit" metrics
-    mean_metrics = {
-        'mean_R_squared': valid_results['best_R-squared'].mean(),
-        'mean_RMSE': valid_results['best_RMSE'].mean(),
-        'mean_AIC': valid_results['best_AIC'].mean(),
-        'num_datasets': len(valid_results)
-    }
-    
-    #calculate standard deviations
-    mean_metrics['std_R_squared'] = valid_results['best_R-squared'].std()
-    mean_metrics['std_RMSE'] = valid_results['best_RMSE'].std()
-    mean_metrics['std_AIC'] = valid_results['best_AIC'].std()
-    
-
-    return mean_metrics

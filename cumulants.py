@@ -1,16 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Mar 13 13:53:48 2025
+cumulants.py
+============
+Cumulant analysis functions for DLS data — Methods A (ALV extraction) and B
+(linear OLS fit to ln√(g²−1) vs lag time).
 
-@author: vinci
+Functions
+---------
+extract_cumulants(file_path, encodings)
+    Extract 1st, 2nd and 3rd order cumulant frequencies and expansion
+    parameters from ALV .ASC files with robust encoding fallback.
 
-cumulant analysis: general, methods A and B
+calculate_g2_B(dataframes_dict)
+    Prepare correlation data for Method B by computing ln√(g²−1),
+    dropping non-positive values and warning on data quality issues.
+
+analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, ...)
+    Linear regression of Γ vs q² (OLS via statsmodels) to extract the
+    translational diffusion coefficient D and associated statistics.
+
+remove_rows_by_index(df, indices_str)
+    Interactive removal of bad-fit rows from a DataFrame by index.
+
+plot_processed_correlations(dataframes_dict, fit_x_limits, xlim, ylim)
+    OLS linear fit to ln√(g²−1) within a user-defined time window,
+    3-panel plot (data+fit | residuals | Q-Q) per correlation file.
+
+Dependencies: numpy, pandas, scipy, matplotlib, statsmodels
 """
+
 import pandas as pd
 import re
 import numpy as np
-from scipy.optimize import curve_fit
-import inspect
+from scipy.stats import linregress
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 import statsmodels.api as sm
@@ -143,45 +165,6 @@ def extract_cumulants(file_path, encodings=['Windows-1252', 'utf-8', 'latin1', '
     print(f"Failed to extract cumulants from {file_path} with any encoding")
     return None
 
-#calculation of cumulant results, specific for method A
-def calculate_cumulant_results_A(A_diff, cumulant_method_A_diff, polydispersity_method_A_2, polydispersity_method_A_3, c, delta_c):
-    results = []
-    orders = [1, 2, 3]
-    pdi_values = [None, polydispersity_method_A_2, polydispersity_method_A_3]
-
-    for i, order in enumerate(orders):
-        result = pd.DataFrame()
-        result['Rh [nm]'] = c * (1 / A_diff['D [m^2/s]'][i]) * 10**9
-        fractional_error_Rh = np.sqrt((delta_c / c)**2 + (A_diff['std err D [m^2/s]'][i] / A_diff['D [m^2/s]'][i])**2)
-        result['Rh error [nm]'] = fractional_error_Rh * result['Rh [nm]']
-        result['R_squared'] = cumulant_method_A_diff['R_squared'][i]
-        result['Fit'] = f'Rh from {order}st order cumulant fit' if order == 1 else f'Rh from {order}nd order cumulant fit' if order == 2 else f'Rh from {order}rd order cumulant fit'
-        result['Residuals'] = cumulant_method_A_diff['Normality'][i]
-        if i > 0: #PDI is only for 2nd and 3rd order
-            result['PDI'] = pdi_values[i]
-        results.append(result)
-
-    df_cumulant_method_A_results = pd.concat(results, ignore_index=True)
-    return df_cumulant_method_A_results
-
-#create zero DataFrame directly, in case of not wanting to perform the cumulant fit mit method A
-def create_zero_cumulant_results_A():
-    results = []
-    orders = [1, 2, 3]
-    
-    for i, order in enumerate(orders):
-        result = pd.DataFrame({
-            'Rh [nm]': [0],
-            'Rh error [nm]': [0], 
-            'R_squared': [0],
-            'Fit': [f'Rh from {order}st order cumulant fit' if order == 1 else f'Rh from {order}nd order cumulant fit' if order == 2 else f'Rh from {order}rd order cumulant fit'],
-            'Residuals': [0]
-        })
-        if i > 0:
-            result['PDI'] = [0]
-        results.append(result)
-    
-    return pd.concat(results, ignore_index=True)
 
 #calculation of g2-values for cumulant-method-B
 def calculate_g2_B(dataframes_dict):
@@ -191,19 +174,20 @@ def calculate_g2_B(dataframes_dict):
         try:
             df_copy = df.copy(deep=True) 
 
-            g2_values = df_copy['g(2)']
+            g2_values = df_copy['g(2)-1']
             
             #drop negative values
             neg_or_zero_mask = g2_values <= 0
             if neg_or_zero_mask.any():
                 num_neg_or_zero = neg_or_zero_mask.sum()
-                print(f"Warning: DataFrame '{name}' contains {num_neg_or_zero} non-positive g(2) values. These rows will be dropped.")
+                print(f"Warning: DataFrame '{name}' contains {num_neg_or_zero} non-positive g(2)-1 values. These rows will be dropped.")
 
             rows_to_keep = g2_values > 0
             df_copy = df_copy[rows_to_keep]  
             df_copy = df_copy.reset_index(drop=True) 
 
-            df_copy['g(2)_mod'] = np.sqrt(df_copy['g(2)'])
+            # ln(sqrt(g2-1)) = 0.5*ln(g2-1)
+            df_copy['g(2)_mod'] = 0.5 * np.log(df_copy['g(2)-1'])
 
             processed_dataframes[name] = df_copy  
 
@@ -214,7 +198,7 @@ def calculate_g2_B(dataframes_dict):
 
 
 #plot Gamma vs. q^2
-def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_names=None, gamma_unit='1/s', x_range=None):
+def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_names=None, gamma_unit='1/s', x_range=None, experiment_name=''):
     #validate inputs
     if not isinstance(gamma_cols, list):
         gamma_cols = [gamma_cols]
@@ -247,8 +231,19 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
         
         method_name = method_names[i] if i < len(method_names) else ''
         
-        #Y-data (full dataset for plotting)
+        #Y-data (full dataset)
         Y_full = data_df[gamma_col]
+        
+        # === NaN FILTERING: Remove rows where gamma is NaN ===
+        # This handles multimodal data where different populations have different valid rows
+        valid_mask = Y_full.notna()
+        X_full_valid = X_full[valid_mask]
+        Y_full_valid = Y_full[valid_mask]
+        
+        # Check if we have enough valid data points
+        if len(X_full_valid) < 2:
+            print(f"Warning: Only {len(X_full_valid)} valid (non-NaN) data points for {gamma_col}. Need at least 2. Skipping...")
+            continue
         
         #filter data for fitting if x_range is specified
         if x_range is not None:
@@ -256,9 +251,9 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
                 raise ValueError("x_range must be a tuple or list of length 2: (min_x, max_x)")
             
             min_x, max_x = x_range
-            mask = (X_full >= min_x) & (X_full <= max_x)
-            X_fit = X_full[mask]
-            Y_fit = Y_full[mask]
+            mask = (X_full_valid >= min_x) & (X_full_valid <= max_x)
+            X_fit = X_full_valid[mask]
+            Y_fit = Y_full_valid[mask]
             
             if len(X_fit) < 2:
                 print(f"Warning: Only {len(X_fit)} data points in specified x_range for {gamma_col}. Need at least 2 points for fitting.")
@@ -266,13 +261,13 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
                 
             fit_range_text = f" (fit range: {min_x:.3f} to {max_x:.3f})"
         else:
-            X_fit = X_full
-            Y_fit = Y_full
+            X_fit = X_full_valid
+            Y_fit = Y_full_valid
             fit_range_text = ""
         
-        #plot all data points
+        #plot all valid data points
         plt.figure(figsize=(8, 4))
-        plt.scatter(X_full, Y_full, alpha=0.6, label='All data')
+        plt.scatter(X_full_valid, Y_full_valid, alpha=0.6, label='All data')
         
         # Highlight fitting data if x_range is specified
         if x_range is not None:
@@ -282,11 +277,11 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
         X_fit_with_constant = sm.add_constant(X_fit)
         model = sm.OLS(Y_fit, X_fit_with_constant).fit()
         
-        #plot regression line over the full x-range for visualization
-        X_line = np.linspace(X_full.min(), X_full.max(), 100)
+        #plot regression line over the valid x-range for visualization
+        X_line = np.linspace(X_full_valid.min(), X_full_valid.max(), 100)
         X_line_with_constant = sm.add_constant(X_line)
         y_predicted_line = model.predict(X_line_with_constant)
-        plt.plot(X_line, y_predicted_line, 'r-', label=f'Regression Line{fit_range_text}')
+        plt.plot(X_line, y_predicted_line, 'r-', label=f'Regression Line')
         
         #print regression results
         print(f"\n--- Linear Regression Results {method_name}{fit_range_text} ---")
@@ -347,11 +342,13 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
         
         #set labels and title
         plt.xlabel('q$^2$ [nm$^{-2}$]')
-        plt.ylabel(f'$\Gamma$ [{gamma_unit}]')
+        plt.ylabel(f'$\\Gamma$ [{gamma_unit}]')
         
-        title = 'q$^2$ vs. $\Gamma$'
+        title = r'q$^2$ vs. $\Gamma$'
         if method_name:
             title += f' ({method_name})'
+        if experiment_name:
+            title += f' — {experiment_name}'
         plt.title(title)
         
         plt.legend()
@@ -384,72 +381,78 @@ def remove_rows_by_index(df, indices_str):
     return df
 
 #plot and fit for method B
-def plot_processed_correlations(dataframes_dict, fit_function, fit_x_limits):
+def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=None):
     all_fit_results = []
     plot_number = 1
     
     for name, df in dataframes_dict.items():
+        if df is None:
+            print(f"Skipping '{name}': no data (None).")
+            continue
         try:
             fit_result = {'filename': name}
 
             #main processing
-            x_data = df['t (s)']
+            x_data = df['t [s]']
             y_data = df['g(2)_mod']
             x_fit = x_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
             y_fit = y_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
-                
-            #perform the fit with bounds
-            popt, pcov = curve_fit(fit_function, x_fit, y_fit, method='lm', maxfev=50000)
-                
-            #calculate parameter errors from covariance matrix
-            perr = np.sqrt(np.diag(pcov))
-                
-            #generate fit curve
-            y_fit_values = fit_function(x_data, *popt)
-                
-            #calculate residuals for Q-Q plot
-            residuals = y_fit - fit_function(x_fit, *popt)
-                
-            #extract parameter names and store fit parameters
-            param_names = inspect.getfullargspec(fit_function).args[1:]
-            for i, param_name in enumerate(param_names):
-                fit_result[param_name] = popt[i]
-                fit_result[f'{param_name}_error'] = perr[i]
-                fit_result[f'{param_name}_relative_error'] = (perr[i] / abs(popt[i])) * 100 if popt[i] != 0 else np.inf
-                
-            # Calculate fit quality metrics
+            
+            slope, intercept, r, p, se = linregress(x_fit, y_fit)
+
+            # Γ = -slope,  a = exp(2 * intercept)
+            Gamma = -slope
+            a     = np.exp(2 * intercept)
+
+            fit_result['Gamma']               = Gamma
+            fit_result['Gamma_error']         = se          # std error of slope
+            fit_result['Gamma_relative_error']= (se / abs(Gamma)) * 100 if Gamma != 0 else np.inf
+            fit_result['a']                   = a
+
+            # generate fit curve over full x range
+            y_fit_values = slope * x_data + intercept
+
+            # residuals
+            residuals = y_fit - (slope * x_fit + intercept)
             ss_res = np.sum(residuals**2)
             ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
             r_squared = 1 - (ss_res / ss_tot)
-            fit_result['R-squared'] = r_squared
+            fit_result['R_squared'] = r_squared
                 
-            #create subplot layout
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-                
-            #left plot: original data and fit
-            ax1.plot(x_data, y_data, marker='.', linestyle='', label='Data')
-            ax1.plot(x_data, y_fit_values, 'r-', label=f'Fit')
-            ax1.set_xlabel('lag time (s)')
-            ax1.set_ylabel(r"$\sqrt{g(2)-1}$")
-            ax1.set_title(f'[{plot_number}]: g(2)-1 vs. lag time for {name}')
-            ax1.grid(True)
-            ax1.set_yscale('log')
-            ax1.set_xlim(0, 0.002)
+            #3-panel layout: data+fit | residuals | Q-Q
+            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+            fig.suptitle(f'[{plot_number}]: Method B — {name}', fontsize=12)
+
+            #panel 1: data + fit
+            ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')
+            ax1.plot(x_data, y_fit_values, 'r-', linewidth=2, label='Fit')
+            ax1.set_xlabel(r'lag time τ [s]')
+            ax1.set_ylabel(r'ln$\sqrt{g^{(2)}(	au)-1}$')
+            ax1.set_title('Data & Fit')
+            ax1.grid(True, alpha=0.3)
+            if xlim is not None:
+                ax1.set_xlim(*xlim)
+            if ylim is not None:
+                ax1.set_ylim(*ylim)
             ax1.legend()
-                
-            #right plot: Q-Q plot
-            stats.probplot(residuals, dist="norm", plot=ax2)
-            ax2.set_title(f'[{plot_number}]: Q-Q Plot of Residuals')
-            ax2.grid(True)
-                
-            #add R^2 as text in the left plot
-            param_text = f"R² = {r_squared:.4f}"
-                
-            #position the text in the upper right of the left plot
-            ax1.text(0.95, 0.95, param_text, transform=ax1.transAxes, 
-                verticalalignment='top', horizontalalignment='right',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
-                
+            ax1.text(0.95, 0.95,
+                     f"R² = {r_squared:.4f}\n⟨Γ⟩ = {Gamma:.3e} s⁻¹",
+                     transform=ax1.transAxes, va='top', ha='right',
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+            #panel 2: residuals
+            ax2.plot(residuals)
+            ax2.axhline(0, color='r', linestyle='--', linewidth=1)
+            ax2.set_xlabel('Sample Index')
+            ax2.set_ylabel('Residuals')
+            ax2.set_title('Residuals')
+            ax2.grid(True, alpha=0.3)
+
+            #panel 3: Q-Q
+            stats.probplot(residuals, dist="norm", plot=ax3)
+            ax3.set_title('Q-Q Plot')
+            ax3.grid(True, alpha=0.3)
+
             plt.tight_layout()
             plt.show()
             plot_number += 1
@@ -461,12 +464,6 @@ def plot_processed_correlations(dataframes_dict, fit_function, fit_x_limits):
             print(f"Error processing DataFrame '{name}': {e}")
             fit_result['Error'] = str(e)
             all_fit_results.append(fit_result)
-        except RuntimeError as e:
-            print(f"Fit error for DataFrame '{name}': {e}")
-            fit_result['Error'] = str(e)
-            all_fit_results.append(fit_result)
     
     final_results_df = pd.DataFrame(all_fit_results)
     return final_results_df
-
-

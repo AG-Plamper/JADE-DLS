@@ -176,8 +176,8 @@ def plot_countrates(all_countrates, ncols=3, show_indices=True):
             for column in df.columns[1:]:
                 ax.plot(df[df.columns[0]], df[column], label=column, linewidth=1) 
 
-            ax.set_xlabel(str(df.columns[0]))
-            ax.set_ylabel("Countrate [kHz]")
+            ax.set_xlabel("time [s]")
+            ax.set_ylabel("countrate [kHz]")
             
             #add index to title if requested
             if show_indices:
@@ -312,8 +312,8 @@ def plot_correlations(all_correlations, ncols=3, show_indices=True):
                 if not (df[column] == 0).all(): 
                     ax.plot(df[df.columns[0]], df[column], label=column, linewidth=1)
 
-            ax.set_xlabel(str(df.columns[0]))
-            ax.set_ylabel("Correlation")
+            ax.set_xlabel("time [ms]")
+            ax.set_ylabel("g(2)-1")
             
             # Add index to title if requested
             if show_indices:
@@ -408,9 +408,9 @@ def process_correlation_data(input_dict, columns_to_remove = None):
             #create a copy to avoid modifying the original DataFrame
             new_df = df.copy()  
             #time in s
-            new_df['t (s)'] = df['time [ms]']*10**(-3)
+            new_df['t [s]'] = df['time [ms]']*10**(-3)
             #calculates the mean of the two correlation detectors
-            new_df['g(2)'] = (df['correlation 1']+df['correlation 2'])/2
+            new_df['g(2)-1'] = (df['correlation 1']+df['correlation 2'])/2
             
             #remove columns
             if columns_to_remove:
