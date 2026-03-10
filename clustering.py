@@ -413,7 +413,37 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
             out_col = f'outlier_pop{pop_num}'
             if out_col in clustered_df.columns and pd.isna(clustered_df.loc[file_idx, out_col]):
                 clustered_df.loc[file_idx, out_col] = True
+                
+    # Remap per-peak columns to population order
+    # original_col e.g. 'gamma_3' → peak index 3 → copy skewness_3 → skewness_pop2
+    _per_peak_prefixes = [
+        'tau', 'intensity', 'normalized_area_percent', 'normalized_sum_percent',
+        'area', 'fwhm', 'centroid', 'std_dev', 'skewness', 'kurtosis',
+    ]
 
+    # initialise pop columns as NaN
+    for pop_num in cluster_id_to_pop.values():
+        for prefix in _per_peak_prefixes:
+            col = f'{prefix}_pop{pop_num}'
+            if any(c.startswith(f'{prefix}_') for c in clustered_df.columns):
+                clustered_df[col] = np.nan
+
+    # fill from the reliable rows using original peak index
+    for _, row in gammas_df_reliable.iterrows():
+        file_idx   = row['file_idx']
+        cluster_id = row['cluster']
+        if cluster_id not in cluster_id_to_pop:
+            continue
+        pop_num   = cluster_id_to_pop[cluster_id]
+        peak_idx  = int(row['original_col'].split('_')[-1])  # e.g. 'gamma_3' → 3
+
+        for prefix in _per_peak_prefixes:
+            src_col = f'{prefix}_{peak_idx}'
+            dst_col = f'{prefix}_pop{pop_num}'
+            if src_col in clustered_df.columns and dst_col in clustered_df.columns:
+                if pd.isna(clustered_df.loc[file_idx, dst_col]):
+                    clustered_df.loc[file_idx, dst_col] = clustered_df.loc[file_idx, src_col]
+                    
     # Step 5: Overall silhouette score on reliable populations
     avg_silhouette = None
     if silhouette_scores is not None and n_reliable_populations > 1:

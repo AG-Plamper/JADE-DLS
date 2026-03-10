@@ -343,7 +343,7 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
             peak_x = decay_times[left_base_idx:right_base_idx+1]
             
             #calculate peak area using trapezoidal rule
-            peak_area = np.trapz(peak_segment, peak_x)
+            peak_area = np.trapz(peak_segment, np.log(peak_x))
             
             #calculate peak width at half maximum (FWHM)
             half_max = peak_amplitudes[i] / 2
@@ -353,7 +353,7 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
                 left_idx = idx_above[0]
                 right_idx = idx_above[-1]
                 if right_idx > left_idx and right_idx < len(peak_x) and left_idx < len(peak_x):
-                    fwhm = peak_x[right_idx] - peak_x[left_idx]
+                    fwhm = np.log(peak_x[right_idx]) - np.log(peak_x[left_idx])
                 else:
                     fwhm = 0
             else:
