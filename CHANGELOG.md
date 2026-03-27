@@ -1,4 +1,50 @@
 # CHANGELOG
+## v2.2.0
+improved cumulant_C fitting process, bug fixes and improved workflow
+### preprocessing.py
+
+- Added plot_countrate_fft(): plots the one-sided power spectral density (PSD) of the countrate time series for each file using the FFT. Displayed as a log-log plot (PSD = |FFT(I)|² · dt / N, units: kHz²/Hz). DC component (f = 0) skipped to allow log-scale display. All-zero and all-NaN detector columns silently skipped. Supports multi-column detector slots and the same ncols/show_indices layout as the existing countrate and correlation plot functions. Useful for identifying periodic noise, dust spikes or instrument artefacts in the countrate signal before fitting.
+
+---
+
+### cumulants_C.py
+
+Major rewrite of the fitting engine in plot_processed_correlations_iterative(). The function now supports two distinct operating modes dispatched by the type of initial_guesses:
+
+- **Adaptive mode** (initial_guesses is a dict): replaces the old individual/global/representative strategy system with a hierarchical log-uniform zoom grid search. Three successive rounds (coarse ±1.5 decades, medium ±0.5, fine ±0.15) each sweep b on a log-uniform grid of 5 points, scaling c, d, e to match (c ∝ b², d ∝ b³, e ∝ b⁴). The best result across all grid points propagates as the starting centre for the next round. Convergence exits early if R² improvement between rounds falls below tolerance.
+
+- **Expert mode** (initial_guesses is a list): preserves the previous iterative single-start refinement from user-supplied parameters. Added a diagnostic warning when the user-supplied b deviates from the data estimate by more than 1 decade.
+
+Additional changes to plot_processed_correlations_iterative():
+- Physical parameter bounds _BOUNDS_LOWER / _BOUNDS_UPPER added as module-level constants and applied to trf/dogbox fits (c, e ≥ 0; d unconstrained; a ∈ [0, 1]; b ∈ [1, 1e6]; f ∈ [−0.1, 0.1]).
+- _metrics() and _do_fit() defined as closures scoped per dataset to reduce code duplication.
+- Graceful RuntimeError handling: failed fits now fill results with NaN and append an Error field instead of crashing the loop.
+- Plot title now shows mode string (adaptive / expert) and number of fit attempts.
+
+estimate_parameters_from_data() simplified: the long heuristic for a, b, f (1/e threshold, log-linear slope, curvature analysis) replaced by a call to the new _simple_exp_prefit(). Priors for c, d, e unchanged (c = 0.05·b², d = 0.01·b³, e = 3·c²).
+
+New module-level helpers:
+- _simple_exp(): 3-parameter single-exponential model used by the pre-fit.
+- _simple_exp_prefit(): fast 3-parameter curve_fit to estimate a, b, f; falls back to safe data-derived heuristics on convergence failure.
+
+Removed functions:
+- get_adaptive_parameters_strategy() — dispatcher wrapper, superseded by mode dispatch in the main fitting function.
+- _individual_strategy(), _global_strategy(), _representative_strategy() — all three strategy implementations removed. The individual strategy logic is now handled directly inside get_adaptive_initial_parameters(). Global and representative strategies are no longer supported.
+
+get_adaptive_initial_parameters() simplified to a single individual pre-fit loop (one _simple_exp_prefit per file), removing the strategy dispatcher call and verbose parameter printing.
+
+---
+
+### clustering.py
+
+- cluster_all_gammas(): monomodal z-score outlier detection is now gated behind if uncertainty_flags:. Previously, the z-score path ran whenever n_reliable_populations == 1 and need_silhouette == True, which could be triggered by clustering_strategy == 'silhouette_refined' alone even without uncertainty_flags=True. This caused unexpected interactive prompts during normal silhouette-refined runs on monomodal samples. The z-score outlier detection now only activates when the user explicitly sets uncertainty_flags=True.
+
+### regularized.py
+
+- nnls_reg(): weighted moments now computed in **log-τ space** instead of linear τ-space. Previously weighted_mean, variance, std_dev, skewness and kurtosis used arithmetic τ values directly (weighted_mean = Σ(w·τ)). Now ln_x = np.log(peak_x) is used throughout: ln_mean = Σ(w·ln_x), weighted_mean = exp(ln_mean) (geometric mean in τ-space), variance = Σ(w·(ln_x − ln_mean)²), with skewness and kurtosis following in log-τ space. This is physically correct since the decay-time grid is log-spaced and area is integrated via d(ln τ); the old arithmetic centroid was biased toward the right tail on a log grid.
+
+- nnls_reg(): centroid marker and annotation in the distribution plot now use f_display = np.interp(tau_display, decay_times, f_optimized) when peak_method == 'centroid', instead of always using if_optimized[peak_idx]. Previously the marker and annotation xy coordinate were always anchored at the amplitude of the peak maximum index regardless of peak_method, causing visual misalignment when the geometric-mean centroid differs from the maximum position.
+
 
 ## v2.1.0
 added intensity and guinier analysis for regularized fit to Jupyter Notebook-File
