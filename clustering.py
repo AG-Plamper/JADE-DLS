@@ -237,35 +237,36 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
     if need_silhouette and n_reliable_populations > 0:
 
         if n_reliable_populations == 1:
-            # --- Monomodal case: z-score outlier detection ---
-            print("OUTLIER DETECTION (monomodal — z-score)")
-            vals = gammas_df_reliable['log_clustering_val'].values
-            mean_val = np.mean(vals)
-            std_val  = np.std(vals)
-            if std_val > 0:
-                z_scores = np.abs((vals - mean_val) / std_val)
-            else:
-                z_scores = np.zeros(len(vals))
-            gammas_df_reliable = gammas_df_reliable.copy()
-            gammas_df_reliable['z_score']  = z_scores
-            gammas_df_reliable['uncertain'] = z_scores > uncertainty_threshold
-            val_label = "log(D)" if normalize_by_q2 else "log(Γ)"
-            print(f"Mean {val_label}: {mean_val:.3f}  Std: {std_val:.3f}")
-            print(f"Flagging points with |z| > {uncertainty_threshold} as uncertain")
-            n_uncertain = gammas_df_reliable['uncertain'].sum()
-            print(f"→ {n_uncertain}/{len(gammas_df_reliable)} uncertain point(s) in single population")
-            if n_uncertain > 0:
-                pct_uncertain = n_uncertain / len(gammas_df_reliable) * 100
-                _show_uncertainty_removal_preview(gammas_df_reliable, n_uncertain, normalize_by_q2)
-                if pct_uncertain > 30.0:
-                    print("\nWARNING: >30% uncertain — consider adjusting distance_threshold.")
-                answer = input("\nRemove outlier points? (y/n): ").strip().lower()
-                if answer == 'y':
-                    gammas_df_reliable = gammas_df_reliable[
-                        ~gammas_df_reliable['uncertain']].copy()
-                    print(f"→ Removed {n_uncertain} outlier points.")
+            # --- Monomodal case: z-score outlier detection (only when uncertainty_flags=True) ---
+            if uncertainty_flags:
+                print("OUTLIER DETECTION (monomodal — z-score)")
+                vals = gammas_df_reliable['log_clustering_val'].values
+                mean_val = np.mean(vals)
+                std_val  = np.std(vals)
+                if std_val > 0:
+                    z_scores = np.abs((vals - mean_val) / std_val)
                 else:
-                    print("\n→ Keeping all data (outliers flagged but not removed)")
+                    z_scores = np.zeros(len(vals))
+                gammas_df_reliable = gammas_df_reliable.copy()
+                gammas_df_reliable['z_score']  = z_scores
+                gammas_df_reliable['uncertain'] = z_scores > uncertainty_threshold
+                val_label = "log(D)" if normalize_by_q2 else "log(Γ)"
+                print(f"Mean {val_label}: {mean_val:.3f}  Std: {std_val:.3f}")
+                print(f"Flagging points with |z| > {uncertainty_threshold} as uncertain")
+                n_uncertain = gammas_df_reliable['uncertain'].sum()
+                print(f"→ {n_uncertain}/{len(gammas_df_reliable)} uncertain point(s) in single population")
+                if n_uncertain > 0:
+                    pct_uncertain = n_uncertain / len(gammas_df_reliable) * 100
+                    _show_uncertainty_removal_preview(gammas_df_reliable, n_uncertain, normalize_by_q2)
+                    if pct_uncertain > 30.0:
+                        print("\nWARNING: >30% uncertain — consider adjusting distance_threshold.")
+                    answer = input("\nRemove outlier points? (y/n): ").strip().lower()
+                    if answer == 'y':
+                        gammas_df_reliable = gammas_df_reliable[
+                            ~gammas_df_reliable['uncertain']].copy()
+                        print(f"→ Removed {n_uncertain} outlier points.")
+                    else:
+                        print("\n→ Keeping all data (outliers flagged but not removed)")
 
         else:
             # --- Multimodal case: silhouette uncertainty on reliable points ---
@@ -452,7 +453,8 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
             avg_silhouette = silhouette_score(
                 log_vals, gammas_df_reliable['cluster'].values
             )
-        except Exception:
+        except Exception as e:
+            print(f"[WARNING] Silhouette score calculation failed: {e}")
             avg_silhouette = None
 
     # Step 6: Plot population distribution

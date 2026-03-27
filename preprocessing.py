@@ -10,6 +10,7 @@ import pandas as pd
 import os
 from io import StringIO
 import matplotlib.pyplot as plt
+import numpy as np
 
 #get folder name
 def get_folder_name(filepath):
@@ -337,6 +338,102 @@ def plot_correlations(all_correlations, ncols=3, show_indices=True):
 
     plt.tight_layout(pad=0.5)
     plt.show()
+
+def plot_countrate_fft(all_countrates, ncols=3, show_indices=True):
+    """
+    Plot the one-sided power spectral density of each detector's countrate
+    time series using the FFT.
+
+    Parameters
+    ----------
+    all_countrates : dict
+        Mapping of filename -> DataFrame with columns [time [s], detectorslot 1..4].
+        Uniform time sampling is assumed.
+    ncols : int, optional
+        Number of subplot columns (default 3).
+    show_indices : bool, optional
+        If True, prepend a numeric index to each subplot title (default True).
+
+    Notes
+    -----
+    PSD = |FFT(I)|^2 * dt / N  (units: kHz^2 / Hz)
+    DC component (f = 0) is skipped to allow log-log display.
+    All-zero and all-NaN detector columns are silently skipped.
+    """
+    n_plots = len(all_countrates)
+    nrows = (n_plots + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(15, 5*nrows))
+
+    if isinstance(axes, plt.Axes):
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+
+    dataset_names = list(all_countrates.keys())
+
+    i = 0
+    for name, df in all_countrates.items():
+        if i < len(axes):
+            ax = axes[i]
+
+            time_col = df.columns[0]
+            t = df[time_col].to_numpy(dtype=float)
+            N = len(t)
+
+            if N < 2:
+                i += 1
+                continue
+
+            dt = (t[-1] - t[0]) / (N - 1)
+            if dt <= 0:
+                i += 1
+                continue
+
+            freqs = np.fft.rfftfreq(N, d=dt)
+            mask = freqs > 0
+            freqs_plot = freqs[mask]
+
+            for column in df.columns[1:]:
+                I = df[column].to_numpy(dtype=float)
+
+                if (I == 0).all() or np.all(np.isnan(I)):
+                    continue
+
+                nan_mask = np.isnan(I)
+                if nan_mask.any():
+                    I[nan_mask] = np.nanmean(I)
+
+                X = np.fft.rfft(I)
+                PSD = (np.abs(X) ** 2) * dt / N
+
+                ax.plot(freqs_plot, PSD[mask], label=column, linewidth=1)
+
+            ax.set_xlabel("frequency [Hz]")
+            ax.set_ylabel("PSD [kHz² / Hz]")
+            ax.set_yscale('log')
+
+            if show_indices:
+                idx = dataset_names.index(name)
+                ax.set_title(f"[{idx}] {name}", fontsize=10)
+            else:
+                ax.set_title(name, fontsize=10)
+
+            ax.legend(fontsize=8)
+            ax.grid(True)
+            ax.tick_params(axis='both', labelsize=8)
+            ax.xaxis.get_major_locator().set_params(nbins=5)
+            ax.yaxis.set_major_locator(plt.LogLocator(base=10, numticks=4))
+            i += 1
+        else:
+            break
+
+    for j in range(i, len(axes)):
+        axes[j].set_axis_off()
+
+    plt.tight_layout(pad=0.5)
+    plt.show()
+
 
 #also similar to as before
 def cli_correlation_exclusion(all_correlations):

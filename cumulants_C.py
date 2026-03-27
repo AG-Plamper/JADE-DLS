@@ -2,39 +2,36 @@
 """
 cumulants_C.py
 ==============
-Cumulant analysis — Method C: iterative multi-start nonlinear fitting
-of the full autocorrelation function g²(τ) with adaptive initial parameter
-estimation.
+Cumulant analysis — Method C: nonlinear fitting of g²(τ) using
+scipy.optimize.curve_fit with two operating modes:
 
-Functions
----------
+  adaptive mode  (initial_guesses dict)  — hierarchical log-uniform zoom grid
+                                           search for the best starting decay
+                                           rate, with per-dataset pre-fitting.
+  expert   mode  (initial_guesses list)  — single-start iterative refinement
+                                           from user-supplied parameters.
+
+Public functions
+----------------
 get_meaningful_parameters(fit_function, full_parameter_list)
-    Filter the parameter list of a fit function to retain only those
-    parameters that appear in its signature.
+    Return the parameter subset relevant to the given fit function
+    (fit_function1–4 use subsets of [a, b, c, d, e, f]).
+
+_simple_exp_prefit(x_data, y_data)
+    Fast 3-parameter single-exponential pre-fit; returns (a, b, f).
+    Falls back to data-derived heuristics on failure.
 
 estimate_parameters_from_data(x_data, y_data, base_parameters)
-    Estimate initial fit parameters directly from correlation data
-    (amplitude from intercept, decay rate from half-life).
+    Estimate all six initial parameters from correlation data using
+    _simple_exp_prefit for a, b, f and scaled priors for c, d, e.
 
-get_adaptive_parameters_strategy(dataframes_dict, fit_function, ...)
-    Dispatcher: selects individual, global or representative strategy
-    for adaptive initial parameter estimation.
+get_adaptive_initial_parameters(dataframes_dict, fit_function, base_parameters, ...)
+    Return a dict of per-dataset initial guesses (one pre-fit per file).
 
-_individual_strategy(...)
-    Estimate initial parameters independently per correlation file.
-
-_global_strategy(...)
-    Estimate initial parameters from all files pooled together.
-
-_representative_strategy(...)
-    Estimate initial parameters from a representative subset of files.
-
-get_adaptive_initial_parameters(dataframes_dict, fit_function, ...)
-    Top-level function returning a dict of initial guesses per file.
-
-plot_processed_correlations_iterative(dataframes_dict, fit_function2, ...)
-    Iterative curve_fit with multiple random starts, 3-panel diagnostic
-    plot (data+fit | residuals | Q-Q), best-iteration selection by R^2.
+plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_limits,
+                                      initial_guesses, ...)
+    Fit and plot all datasets. Dispatches to adaptive or expert mode based on
+    whether initial_guesses is a dict or list. Returns a DataFrame of results.
 
 Dependencies: numpy, pandas, scipy, matplotlib
 """
@@ -44,6 +41,12 @@ import inspect
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
+
+#physical parameter bounds used when method='trf' or 'dogbox'
+#c = μ₂ (variance) and e = μ₄ (4th moment) are mathematically non-negative;
+#d = μ₃ (3rd moment) is unconstrained in sign (left/right skew both valid)
+_BOUNDS_LOWER = {'a':  0.0, 'b':  0.0, 'c':  0.0, 'd': -np.inf, 'e':  0.0, 'f': -0.1}
+_BOUNDS_UPPER = {'a':  1.0, 'b':  1e6, 'c':  np.inf, 'd': np.inf, 'e': np.inf, 'f':  0.1}
 
 #get the meaningful initial parameters for cumulant fit method C
 def get_meaningful_parameters(fit_function, full_parameter_list):
@@ -63,94 +66,52 @@ def get_meaningful_parameters(fit_function, full_parameter_list):
     else:
         raise ValueError(f"Unknown fit function: {func_name}")
 
-#estimation of inital parameter for cumulant fit method C
+#module-level helper: single exponential model used by the pre-fit
+def _simple_exp(t, a, b, f):
+    return a * np.exp(-b * t) + f
+
+#module-level pre-fit: returns (a, b, f) from a fast 3-parameter single-exponential fit.
+#used both by estimate_parameters_from_data() and the zoom loop in the main fitting function.
+def _simple_exp_prefit(x_data, y_data):
+    """Fast 3-parameter single-exponential pre-fit to estimate a, b, f.
+    Falls back to safe data-derived heuristics if the fit diverges."""
+    try:
+        p0 = [float(y_data[0] - y_data[-1]),
+              float(1.0 / x_data[len(x_data) // 2]),
+              float(y_data[-1])]
+        popt, _ = curve_fit(
+            _simple_exp, x_data, y_data,
+            p0=p0,
+            method='trf',
+            bounds=([0.0,  0.0, -0.1],
+                    [1.0, 1e6,  0.1]),
+            maxfev=5000
+        )
+        return float(popt[0]), float(popt[1]), float(popt[2])
+    except Exception:
+        a = float(np.clip(y_data[0] - y_data[-1], 0.01, 1.0))
+        f = float(np.clip(y_data[-1], -0.1, 0.1))
+        b = float(np.clip(1.0 / x_data[len(x_data) // 2], 1.0, 1e6))
+        return a, b, f
+
+#estimation of initial parameters for cumulant fit method C.
+#a, b, f from _simple_exp_prefit(); c, d, e from physically motivated priors scaled to b.
 def estimate_parameters_from_data(x_data, y_data, base_parameters):
     try:
-        y_max = np.max(y_data)
-        y_min = np.min(y_data)
-        y_range = y_max - y_min
-        
-        #amplitude estimate (with safety check)
-        amplitude_estimate = max(0.1, y_range)
-        
-        #baseline estimate
-        baseline_estimate = y_min
-        
-        #decay rate estimation
-        #1: Find where signal drops to ~37% (1/e)
-        threshold = y_min + 0.37 * y_range
-        decay_indices = np.where(y_data <= threshold)[0]
-        
-        if len(decay_indices) > 0 and decay_indices[0] < len(x_data):
-            decay_time = x_data[decay_indices[0]]
-            if decay_time > 0:
-                decay_rate_estimate = 1.0 / decay_time
-            else:
-                decay_rate_estimate = base_parameters[1]  # Fall back to base
-        else:
-            #2: Use characteristic time from log-linear region
-            try:
-                #find a reasonable range for linear fit in log space
-                log_y = np.log(np.maximum(y_data - baseline_estimate, 1e-10))
-                mid_idx = len(x_data) // 4  #use first quarter of data
-                end_idx = len(x_data) // 2
-                
-                if end_idx > mid_idx + 3:  #ensure enough points
-                    x_fit_region = x_data[mid_idx:end_idx]
-                    log_y_fit_region = log_y[mid_idx:end_idx]
-                    
-                    #linear fit in log space
-                    coeffs = np.polyfit(x_fit_region, log_y_fit_region, 1)
-                    decay_rate_estimate = abs(coeffs[0])  #slope magnitude
-                else:
-                    decay_rate_estimate = base_parameters[1]
-            except:
-                decay_rate_estimate = base_parameters[1]
-        
-        #for monodisperse systems, c ≈ 0, for polydisperse systems, c can be positive (typical range: 0 to 0.5*b²)
-        c_estimate = 0.1 * decay_rate_estimate**2  #start with small polydispersity
-        
-        # d (3rd cumulant) - related to asymmetry of size distribution
-        #typical range: -0.1*b³ to +0.1*b³
-        d_estimate = 0.01 * decay_rate_estimate**3  #small positive asymmetry
-        
-        # e (4th cumulant) - related to kurtosis of size distribution
-        #for Gaussian distributions: e = 3*c²
-        e_estimate = 3 * c_estimate**2
-        
-        #alternative approach: estimate from curvature in early decay
-        try:
-            #look at curvature in the first 20% of data for better c estimate
-            early_idx = int(0.2 * len(x_data))
-            if early_idx > 5:
-                x_early = x_data[:early_idx]
-                y_early = y_data[:early_idx]
-                
-                #fit a simple exponential to get deviation
-                simple_exp = amplitude_estimate * np.exp(-decay_rate_estimate * x_early) + baseline_estimate
-                residual_early = y_early - simple_exp
-                
-                #if there's systematic curvature, adjust c
-                if len(residual_early) > 3:
-                    #positive curvature suggests polydispersity
-                    mean_residual = np.mean(residual_early[1:-1])  #exclude endpoints
-                    if abs(mean_residual) > 0.01 * amplitude_estimate:
-                        c_estimate = np.clip(mean_residual / amplitude_estimate * decay_rate_estimate**2, 
-                                           0, 0.5 * decay_rate_estimate**2)
-                        e_estimate = 3 * c_estimate**2
-        except:
-            pass  #keep original estimates if curvature analysis fails
-        
-        #apply reasonable bounds to all estimates
-        decay_rate_estimate = np.clip(decay_rate_estimate, 1, 1e6)
-        amplitude_estimate = np.clip(amplitude_estimate, 0.01, 10)
-        baseline_estimate = np.clip(baseline_estimate, -1, 1)
-        
-        #bounds for cumulant parameters
-        c_estimate = np.clip(c_estimate, 0, decay_rate_estimate**2)  #non-negative, physical limit
+        amplitude_estimate, decay_rate_estimate, baseline_estimate = _simple_exp_prefit(x_data, y_data)
+
+        c_estimate = 0.05 * decay_rate_estimate**2   # PDI ≈ 0.05 starting point
+        d_estimate = 0.01 * decay_rate_estimate**3   # small positive asymmetry prior
+        e_estimate = 3    * c_estimate**2             # Gaussian-distribution assumption
+
+        #apply physical bounds as a safety net
+        decay_rate_estimate = np.clip(decay_rate_estimate, 1,    1e6)
+        amplitude_estimate  = np.clip(amplitude_estimate,  0.01, 10)
+        baseline_estimate   = np.clip(baseline_estimate,  -1,    1)
+        c_estimate = np.clip(c_estimate, 0,                       decay_rate_estimate**2)
         d_estimate = np.clip(d_estimate, -0.1 * decay_rate_estimate**3, 0.1 * decay_rate_estimate**3)
-        e_estimate = np.clip(e_estimate, 0, 10 * c_estimate**2)  #non-negative, reasonable upper bound
-        
+        e_estimate = np.clip(e_estimate, 0,                       10 * c_estimate**2)
+
         return {
             'a': amplitude_estimate,
             'b': decay_rate_estimate,
@@ -159,7 +120,7 @@ def estimate_parameters_from_data(x_data, y_data, base_parameters):
             'e': e_estimate,
             'f': baseline_estimate
         }
-        
+
     except Exception as e:
         print(f"Warning: Parameter estimation failed ({e}), using base parameters")
         return {
@@ -172,137 +133,49 @@ def estimate_parameters_from_data(x_data, y_data, base_parameters):
         }
 
 #different approaches for adaptive fitting
-def get_adaptive_parameters_strategy(dataframes_dict, fit_function, base_parameters, 
-                                   strategy='individual', x_col='t [s]', y_col='g(2)-1'):
-    
-    if strategy == 'individual':
-        return _individual_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col)
-    elif strategy == 'global':
-        return _global_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col)
-    elif strategy == 'representative':
-        return _representative_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col)
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
+#estimate per-dataset initial parameters via fast single-exponential pre-fit
+def get_adaptive_initial_parameters(dataframes_dict, fit_function, base_parameters,
+                                    x_col='t [s]', y_col='g(2)-1', verbose=True):
+    if verbose:
+        print(f"Estimating adaptive parameters for {fit_function.__name__}...")
 
-def _individual_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col):
+    idx_map         = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5}
     adaptive_params = {}
-    
     for name, df in dataframes_dict.items():
         try:
-            x_data = df[x_col].values
-            y_data = df[y_col].values
-            
-            #get adaptive estimates
+            x_data   = df[x_col].to_numpy()
+            y_data   = df[y_col].to_numpy()
             estimates = estimate_parameters_from_data(x_data, y_data, base_parameters)
-            
-            #apply estimates to base parameters
-            updated_params = base_parameters.copy()
-            for param_name, value in estimates.items():
-                param_index = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5}[param_name]
-                updated_params[param_index] = value
-            
-            #extract meaningful parameters for the fit function
-            meaningful_params = get_meaningful_parameters(fit_function, updated_params)
-            adaptive_params[name] = meaningful_params
-            
+            updated  = base_parameters.copy()
+            for pname, val in estimates.items():
+                updated[idx_map[pname]] = val
+            adaptive_params[name] = get_meaningful_parameters(fit_function, updated)
         except Exception as e:
             print(f"Warning: Failed to adapt parameters for {name} ({e}), using base parameters")
             adaptive_params[name] = get_meaningful_parameters(fit_function, base_parameters)
-    
-    return adaptive_params
 
-def _global_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col):
-    all_amplitudes = []
-    all_baselines = []
-    all_decay_rates = []
-    
-    #collect estimates from all dataframes
-    for name, df in dataframes_dict.items():
-        try:
-            x_data = df[x_col].values
-            y_data = df[y_col].values
-            estimates = estimate_parameters_from_data(x_data, y_data, base_parameters)
-            
-            if estimates:
-                all_amplitudes.append(estimates.get('a', base_parameters[0]))
-                all_baselines.append(estimates.get('f', base_parameters[5]))
-                all_decay_rates.append(estimates.get('b', base_parameters[1]))
-        except:
-            continue
-    
-    #calculate global estimates
-    if all_amplitudes and all_baselines and all_decay_rates:
-        global_params = base_parameters.copy()
-        global_params[0] = np.median(all_amplitudes)  #use median for robustness
-        global_params[1] = np.median(all_decay_rates)
-        global_params[5] = np.median(all_baselines)
-    else:
-        global_params = base_parameters.copy()
-    
-    #apply same global parameters to all dataframes
-    meaningful_params = get_meaningful_parameters(fit_function, global_params)
-    return {name: meaningful_params for name in dataframes_dict.keys()}
-
-def _representative_strategy(dataframes_dict, fit_function, base_parameters, x_col, y_col):
-    #choose the dataset with the best signal-to-noise ratio
-    best_snr = -1
-    representative_estimates = {}
-    
-    for name, df in dataframes_dict.items():
-        try:
-            y_data = df[y_col].values
-            y_mean = np.mean(y_data)
-            y_std = np.std(y_data)
-            snr = y_mean / y_std if y_std > 0 else 0
-            
-            if snr > best_snr:
-                best_snr = snr
-                x_data = df[x_col].values
-                representative_estimates = estimate_parameters_from_data(x_data, y_data, base_parameters)
-        except:
-            continue
-    
-    #apply representative estimates
-    if representative_estimates:
-        updated_params = base_parameters.copy()
-        for param_name, value in representative_estimates.items():
-            param_index = {'a': 0, 'b': 1, 'c': 2, 'd': 3, 'e': 4, 'f': 5}[param_name]
-            updated_params[param_index] = value
-    else:
-        updated_params = base_parameters.copy()
-    
-    meaningful_params = get_meaningful_parameters(fit_function, updated_params)
-    return {name: meaningful_params for name in dataframes_dict.keys()}
-
-#convenience wrapper function for easy integration
-def get_adaptive_initial_parameters(dataframes_dict, fit_function, base_parameters, 
-                                  strategy='individual', x_col='t [s]', y_col='g(2)-1', 
-                                  verbose=True):
-    if verbose:
-        print(f"Using '{strategy}' strategy for parameter adaptation...")
-        print(f"Base parameters: {base_parameters}")
-        print(f"Fit function: {fit_function.__name__}")
-    
-    adaptive_params = get_adaptive_parameters_strategy(
-        dataframes_dict, fit_function, base_parameters, strategy, x_col, y_col
-    )
-    
     if verbose:
         print(f"Generated adaptive parameters for {len(adaptive_params)} datasets")
-
-        #show parameters
-        sample_names = list(adaptive_params.keys())
-        for name in sample_names:
-            print(f"  {name}: {adaptive_params[name]}")
-    
     return adaptive_params
 
 #fit and plot for cumulant-method C
-def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_limits, initial_guesses, 
-                                         max_iterations=10, tolerance=1e-4, maxfev=50000, 
+#  adaptive mode  (initial_guesses is a dict)  → hierarchical zoom grid search
+#  expert   mode  (initial_guesses is a list)  → direct iterative refinement from user parameters
+def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_limits, initial_guesses,
+                                         max_iterations=10, tolerance=1e-4, maxfev=50000,
                                          method='lm', plot_number_start=1):
+
+    #zoom rounds: coarse → medium → fine (adaptive mode only)
+    _ZOOM_ROUNDS = [
+        dict(half_decades=1.5, n_points=5, maxfev=1_000),
+        dict(half_decades=0.5, n_points=5, maxfev=5_000),
+        dict(half_decades=0.15, n_points=5, maxfev=50_000),
+    ]
+
     all_fit_results = []
-    plot_number = plot_number_start
+    plot_number     = plot_number_start
+    param_names     = inspect.getfullargspec(fit_function2).args[1:]
+    _is_adaptive    = isinstance(initial_guesses, dict)
 
     for name, df in dataframes_dict.items():
         fit_result = {'filename': name}
@@ -314,130 +187,193 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             y_fit = y_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
 
             if len(x_fit) < 2:
-                print(f"Not enough data points in the specified range for fitting {name}. Skipping Fit.")
+                print(f"Not enough data points in the specified range for fitting {name}. Skipping.")
                 all_fit_results.append(fit_result)
                 continue
-            
-            if isinstance(initial_guesses, dict):
-                current_guess = initial_guesses[name].copy()  #get the parameters for this dataset (adaptive mode)
-            else:
-                current_guess = initial_guesses.copy()  #use the parameters for all datasets
-            
-            #store iterations for plotting
-            all_y_fits = []
+
+            all_y_fits    = []
             all_r_squared = []
-            all_rmse = []
-            all_aic = []
 
-            param_names = inspect.getfullargspec(fit_function2).args[1:]  #get parameter names from function
-            
-            for i in range(max_iterations):
+            #helpers scoped to this dataset
+            def _metrics(popt):
+                yc     = fit_function2(x_fit, *popt)
+                res    = y_fit - yc
+                ss_res = np.sum(res**2)
+                ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
+                r2     = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+                n      = len(y_fit)
+                k      = len(popt) + 1
+                return r2, float(np.sqrt(ss_res / n)), float(n * np.log(ss_res / n) + 2 * k)
+
+            def _do_fit(p0, maxfev_override=None):
+                mfev = maxfev_override if maxfev_override is not None else maxfev
+                if method == 'lm':
+                    return curve_fit(fit_function2, x_fit, y_fit, p0=p0, maxfev=mfev)
+                bounds = ([_BOUNDS_LOWER[pn] for pn in param_names],
+                          [_BOUNDS_UPPER[pn] for pn in param_names])
+                return curve_fit(fit_function2, x_fit, y_fit, p0=p0,
+                                 method=method, bounds=bounds, maxfev=mfev)
+
+            best_popt = None
+            best_pcov = None
+            pcov      = None
+
+            # ----------------------------------------------------------------
+            # PATH A — Adaptive / Zoom mode
+            # ----------------------------------------------------------------
+            if _is_adaptive:
+                guess    = initial_guesses[name].copy()
+                b_center = float(guess[1])
+                a_base   = float(guess[0])
+                f_base   = float(guess[-1])
+                c_base   = float(guess[param_names.index('c')]) if 'c' in param_names else None
+                d_base   = float(guess[param_names.index('d')]) if 'd' in param_names else None
+                e_base   = float(guess[param_names.index('e')]) if 'e' in param_names else None
+
+                best_r2 = -np.inf
+                prev_r2 = -np.inf
+
+                for rnd in _ZOOM_ROUNDS:
+                    b_grid        = b_center * np.logspace(-rnd['half_decades'], rnd['half_decades'], rnd['n_points'])
+                    rnd_best_popt = None
+                    rnd_best_pcov = None
+                    rnd_best_r2   = -np.inf
+
+                    for b_i in b_grid:
+                        scale = b_i / b_center
+                        p0 = []
+                        for pn in param_names:
+                            if   pn == 'a': p0.append(a_base)
+                            elif pn == 'b': p0.append(float(b_i))
+                            elif pn == 'c': p0.append(c_base * scale**2)
+                            elif pn == 'd': p0.append(d_base * scale**3)
+                            elif pn == 'e': p0.append(e_base * scale**4)
+                            elif pn == 'f': p0.append(f_base)
+                        try:
+                            popt_i, pcov_i = _do_fit(p0, rnd['maxfev'])
+                            r2_i, _, _     = _metrics(popt_i)
+                            all_y_fits.append((popt_i, fit_function2(x_data, *popt_i)))
+                            all_r_squared.append(r2_i)
+                            if r2_i > rnd_best_r2:
+                                rnd_best_r2   = r2_i
+                                rnd_best_popt = popt_i
+                                rnd_best_pcov = pcov_i
+                        except RuntimeError:
+                            continue  # skip failed grid point
+
+                    if rnd_best_popt is None:
+                        continue  # round failed — try next round with higher maxfev
+
+                    if rnd_best_r2 > best_r2:
+                        best_r2   = rnd_best_r2
+                        best_popt = rnd_best_popt
+                        best_pcov = rnd_best_pcov
+
+                    #update base for next round from best solution found so far
+                    b_center = float(best_popt[1])
+                    a_base   = float(best_popt[0])
+                    f_base   = float(best_popt[-1])
+                    if 'c' in param_names: c_base = float(best_popt[param_names.index('c')])
+                    if 'd' in param_names: d_base = float(best_popt[param_names.index('d')])
+                    if 'e' in param_names: e_base = float(best_popt[param_names.index('e')])
+
+                    if (best_r2 - prev_r2) < tolerance:
+                        break  # no room for improvement
+                    prev_r2 = best_r2
+
+                if best_popt is None:
+                    raise RuntimeError("All zoom grid points failed to converge.")
+                pcov = best_pcov
+
+            # ----------------------------------------------------------------
+            # PATH B — Expert mode (user-supplied static parameters)
+            # ----------------------------------------------------------------
+            else:
+                current_guess = get_meaningful_parameters(fit_function2, initial_guesses)
+
+                #warn if user's b deviates from data estimate by more than 1 decade
                 try:
-                    #use the specified optimization method
-                    if method == 'lm':
-                        popt, pcov = curve_fit(fit_function2, x_fit, y_fit, p0=current_guess, maxfev=maxfev)
-                    else:
-                        #for 'trf' and 'dogbox', bounds should be specified, but just very wide bounds are used
-                        bounds = ([-np.inf] * len(current_guess), [np.inf] * len(current_guess))
-                        popt, pcov = curve_fit(fit_function2, x_fit, y_fit, p0=current_guess, 
-                                              method=method, bounds=bounds, maxfev=maxfev)
+                    _, b_pre, _ = _simple_exp_prefit(x_fit.to_numpy(), y_fit.to_numpy())
+                    b_user = current_guess[1]
+                    if b_pre > 0 and b_user > 0 and abs(np.log10(b_user) - np.log10(b_pre)) > 1.0:
+                        print(f"[INFO] '{name}': provided b={b_user:.2e} deviates from "
+                              f"estimated b={b_pre:.2e} by more than 1 decade.")
+                except Exception:
+                    pass
 
-                    y_fit_values = fit_function2(x_data, *popt)
-                    all_y_fits.append((popt, y_fit_values))
+                for i in range(max_iterations):
+                    try:
+                        popt, pcov = _do_fit(current_guess)
+                    except RuntimeError as e:
+                        print(f"Fit error in iteration {i+1} for '{name}': {e}")
+                        break
 
+                    all_y_fits.append((popt, fit_function2(x_data, *popt)))
                     current_guess = popt
 
-                    #calculate y_fit values only within the fitting range
-                    y_fit_current = fit_function2(x_fit, *popt)
-                    
-                    #calculate R-squared
-                    residuals = y_fit - y_fit_current
-                    ss_res = np.sum(residuals**2)
-                    ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
-                    r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-                    all_r_squared.append(r_squared)
-                    
-                    #calculate RMSE (Root Mean Square Error)
-                    n = len(y_fit)
-                    rmse = np.sqrt(ss_res / n)
-                    all_rmse.append(rmse)
-                    
-                    #calculate AIC (Akaike Information Criterion)
-                    # k is the number of parameters (including the error variance)
-                    k = len(popt) + 1
-                    aic = n * np.log(ss_res / n) + 2 * k
-                    all_aic.append(aic)
+                    r2, rmse, aic = _metrics(popt)
+                    all_r_squared.append(r2)
+                    fit_result[f'R-squared_iter{i+1}'] = r2
+                    fit_result[f'RMSE_iter{i+1}']      = rmse
+                    fit_result[f'AIC_iter{i+1}']       = aic
+                    for j, pn in enumerate(param_names):
+                        fit_result[f'{pn}_iter{i+1}'] = popt[j]
 
-                    #store metrics for this iteration
-                    fit_result[f'R-squared_iter{i+1}'] = r_squared
-                    fit_result[f'RMSE_iter{i+1}'] = rmse
-                    fit_result[f'AIC_iter{i+1}'] = aic
-                    
-                    #store parameters for this iteration
-                    for j, param_name in enumerate(param_names):
-                        fit_result[f'{param_name}_iter{i+1}'] = popt[j]
+                    if i > 0 and abs(all_r_squared[-1] - all_r_squared[-2]) < tolerance:
+                        print(f"Converged after {i+1} iterations for {name}.")
+                        break
 
-                    #check for convergence
-                    if i > 0:
-                        delta_r_squared = abs(fit_result[f'R-squared_iter{i+1}'] - fit_result[f'R-squared_iter{i}'])
-                        if delta_r_squared < tolerance:
-                            print(f"Converged after {i+1} iterations for {name}.")
-                            break
+            # ----------------------------------------------------------------
+            # Common: select best result, store, plot
+            # ----------------------------------------------------------------
+            if not all_r_squared:
+                raise RuntimeError("No successful fit attempts.")
 
-                except RuntimeError as e:
-                    print(f"Fit error in iteration {i+1} for DataFrame '{name}': {e}")
-                    break
+            best_idx              = int(np.argmax(all_r_squared))
+            best_popt, best_y_fit = all_y_fits[best_idx]
+            best_r2_val           = all_r_squared[best_idx]
 
-            #find the best iteration (using R-squared)
-            best_iteration_index = np.argmax(all_r_squared)
-            best_popt, best_y_fit = all_y_fits[best_iteration_index]
-            best_iteration = best_iteration_index + 1
-            
-            #store best fit results
-            fit_result['best_R-squared'] = all_r_squared[best_iteration_index]
-            fit_result['best_RMSE'] = all_rmse[best_iteration_index]
-            fit_result['best_AIC'] = all_aic[best_iteration_index]
+            yc_best        = fit_function2(x_fit, *best_popt)
+            best_residuals = y_fit - yc_best
+            ss_res_best    = np.sum(best_residuals**2)
+            n              = len(y_fit)
+            k              = len(best_popt) + 1
 
-            for j, param_name in enumerate(param_names):
-                param_value = best_popt[j]
-                if isinstance(param_value, np.ndarray) and param_value.size == 1:
-                    fit_result['best_' + param_name] = param_value.item()
-                elif isinstance(param_value, list) and len(param_value) == 1:
-                    fit_result['best_' + param_name] = param_value[0]
-                else:
-                    fit_result['best_' + param_name] = param_value
+            fit_result['best_R-squared'] = best_r2_val
+            fit_result['best_RMSE']      = float(np.sqrt(ss_res_best / n))
+            fit_result['best_AIC']       = float(n * np.log(ss_res_best / n) + 2 * k)
 
-            #calculate parameter uncertainties from covariance matrix
+            for j, pn in enumerate(param_names):
+                pv = best_popt[j]
+                fit_result['best_' + pn] = float(pv.item() if isinstance(pv, np.ndarray) and pv.size == 1 else pv)
+
             if pcov is not None:
                 perr = np.sqrt(np.diag(pcov))
-                for j, param_name in enumerate(param_names):
-                    if j < len(perr):  # Safety check
-                        err_value = perr[j]
-                        if isinstance(err_value, np.ndarray) and err_value.size == 1:
-                            fit_result['err_' + param_name] = err_value.item()
-                        else:
-                            fit_result['err_' + param_name] = err_value
-    
-            all_fit_results.append(fit_result)
-            
-            #calculate residuals for the best fit for Q-Q plot
-            best_y_fit_values_in_range = fit_function2(x_fit, *best_popt)
-            best_residuals = y_fit - best_y_fit_values_in_range
+                for j, pn in enumerate(param_names):
+                    if j < len(perr):
+                        ev = perr[j]
+                        fit_result['err_' + pn] = float(ev.item() if isinstance(ev, np.ndarray) and ev.size == 1 else ev)
 
-            #3-panel layout: data+fit | residuals | Q-Q
+            if fit_function2.__name__ == 'fit_function4':
+                c_p = best_popt[2]
+                e_p = best_popt[4]
+                fit_result['kurtosis'] = float(e_p / c_p**2) if c_p != 0 else float('nan')
+
+            all_fit_results.append(fit_result)
+
+            #3-panel diagnostic plot: data+fit | residuals | Q-Q
+            mode_str = (f'adaptive ({len(all_r_squared)} attempts)'
+                        if _is_adaptive else f'expert (iter {best_idx+1})')
             fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
             fig.suptitle(f'[{plot_number}]: Method C ({fit_function2.__name__}) — {name}', fontsize=12)
 
-            #panel 1: data + fit iterations
             ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')
-            for i, (popt, y_fit_values) in enumerate(all_y_fits):
-                if i == best_iteration_index:
-                    ax1.plot(x_data, y_fit_values, 'r-', linewidth=2,
-                             label=f'Best fit (iter {best_iteration})')
+            for i, (popt_i, y_i) in enumerate(all_y_fits):
+                if i == best_idx:
+                    ax1.plot(x_data, y_i, 'r-', linewidth=2, label=f'Best fit ({mode_str})')
                 else:
-                    opacity = 0.3 + 0.5 * (i / len(all_y_fits))
-                    ax1.plot(x_data, y_fit_values, '-', alpha=opacity,
-                             color='gray', linewidth=1)
+                    ax1.plot(x_data, y_i, '-', color='gray', linewidth=1,
+                             alpha=max(0.1, 0.3 + 0.5 * (i / len(all_y_fits))))
             ax1.set_xlabel(r'lag time τ [s]')
             ax1.set_ylabel(r'$g^{(2)}(\tau) - 1$')
             ax1.set_title('Data & Fit')
@@ -445,14 +381,11 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             ax1.set_xscale('log')
             ax1.set_xlim(1e-6, 10)
             ax1.legend()
-            param_text = (f"iter {best_iteration}\n"
-                          f"R² = {all_r_squared[best_iteration_index]:.4f}\n"
-                          f"⟨Γ⟩ = {best_popt[1]:.3e} s⁻¹")
-            ax1.text(0.95, 0.95, param_text, transform=ax1.transAxes,
-                    va='top', ha='right',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+            ax1.text(0.95, 0.95,
+                     f"R² = {best_r2_val:.4f}\n⟨Γ⟩ = {best_popt[1]:.3e} s⁻¹",
+                     transform=ax1.transAxes, va='top', ha='right',
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
-            #panel 2: residuals
             ax2.plot(best_residuals)
             ax2.axhline(0, color='r', linestyle='--', linewidth=1)
             ax2.set_xlabel('Sample Index')
@@ -460,7 +393,6 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             ax2.set_title('Residuals')
             ax2.grid(True, alpha=0.3)
 
-            #panel 3: Q-Q
             stats.probplot(best_residuals, dist="norm", plot=ax3)
             ax3.set_title('Q-Q Plot')
             ax3.grid(True, alpha=0.3)
@@ -469,10 +401,19 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             plt.show()
             plot_number += 1
 
+        except RuntimeError as e:
+            print(f"[WARNING] '{name}': fit failed — {e}. Filling with NaN.")
+            fit_result['Error'] = str(e)
+            for col in ['best_R-squared', 'best_RMSE', 'best_AIC']:
+                fit_result.setdefault(col, np.nan)
+            for pn in param_names:
+                fit_result.setdefault('best_' + pn, np.nan)
+                fit_result.setdefault('err_'  + pn, np.nan)
+            all_fit_results.append(fit_result)
+
         except (KeyError, TypeError) as e:
             print(f"Error processing DataFrame '{name}': {e}")
             fit_result['Error'] = str(e)
             all_fit_results.append(fit_result)
 
-    final_results_df = pd.DataFrame(all_fit_results)
-    return final_results_df
+    return pd.DataFrame(all_fit_results)
