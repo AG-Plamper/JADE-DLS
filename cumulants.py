@@ -427,7 +427,7 @@ def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=N
             ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')
             ax1.plot(x_data, y_fit_values, 'r-', linewidth=2, label='Fit')
             ax1.set_xlabel(r'lag time τ [s]')
-            ax1.set_ylabel(r'ln$\sqrt{g^{(2)}(	au)-1}$')
+            ax1.set_ylabel(r'ln$\sqrt{g^{(2)}(τ)-1}$')
             ax1.set_title('Data & Fit')
             ax1.grid(True, alpha=0.3)
             if xlim is not None:
