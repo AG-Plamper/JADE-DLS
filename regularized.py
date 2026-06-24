@@ -146,7 +146,7 @@ def nnls(df, name, nnls_params, plot_number):
     plt.show()
     
     #prepare results for this dataframe
-    results = {'filename': name}
+    results = {'filename': name, 'f_optimized': f_optimized}
     
     results['R_squared'] = r_squared
     for i, peak_index in enumerate(peaks):
@@ -187,11 +187,15 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     normalize = nnls_reg_params.get('normalize', False) #default, no normalization
     sparsity_penalty = nnls_reg_params.get('sparsity_penalty', 0.0) #default no penalty
     peak_method = nnls_reg_params.get('peak_method', 'maximum')  #'maximum' or 'centroid'
-        
+    fit_beta = nnls_reg_params.get('fit_beta', False)
+
     #the vectors
     tau = df['t [s]'].to_numpy()
     D = df['g(2)-1'].to_numpy()
-    
+
+    #initial beta estimate from the first few data points (g²(0)-1 ≈ β)
+    beta_init = float(np.max(D[:min(5, len(D))])) if fit_beta else 1.0
+
     #create grid of tau and decay time combinations
     decay_times_N, tau_M = np.meshgrid(decay_times, tau)
     
@@ -209,90 +213,89 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     #create the regularization matrix (second derivative)
     D2 = create_tikhonov_matrix(n)
 
-    def residuals_regularized(f, T, D, D2, alpha):
-        #apply normalization constraint if enabled
+    def residuals_regularized(params_vec, T, D, D2, alpha):
+        if fit_beta:
+            beta_val = params_vec[0]
+            f = params_vec[1:]
+        else:
+            beta_val = 1.0
+            f = params_vec
         if normalize:
-            #normalize f to sum to 1.0
             f = f / np.sum(f) if np.sum(f) > 0 else f
-        
-        # Model: g(2)(τ) = (∑_i A_i * exp(-τ/τ_i))^2
-        model_output = (T @ f)**2
-        
-        #data fidelity residuals
+        # Model: g(2)(τ)-1 = β · (∑_i A_i · exp(-τ/τ_i))²
+        model_output = beta_val * (T @ f)**2
         fit_residuals = model_output - D
-        
-        #initialize residuals list with fit residuals
         all_residuals = [fit_residuals]
-        
-        #smoothness regularization term
         smoothness_penalty = alpha * (D2 @ f)
         all_residuals.append(smoothness_penalty)
-        
-        #apply sparsity penalty (L1 norm) if enabled
         if sparsity_penalty > 0:
             l1_penalty = sparsity_penalty * f
             all_residuals.append(l1_penalty)
-            
         return np.concatenate(all_residuals)
     
     # optimization approach based on normalization constraint
     if normalize:
-        def objective_function(f):
-            #make a copy to avoid modifying the original
-            f_copy = np.copy(f)
-            #ensure non-negativity
-            f_copy = np.maximum(f_copy, 0)
-            #normalize to sum to 1
-            f_copy = f_copy / np.sum(f_copy) if np.sum(f_copy) > 0 else f_copy
-            #compute all residuals
-            residuals = residuals_regularized(f_copy, T, D, D2, alpha)
-            #return sum of squared residuals
-            return np.sum(residuals**2)
-        
-        #initial guess normalized to sum to 1
-        f0 = np.ones(T.shape[1]) / T.shape[1]
-        
-        #constraint: sum of f equals 1
-        constraint = {'type': 'eq', 'fun': lambda f: np.sum(f) - 1.0}
-        
-        #bounds: all elements of f must be non-negative
-        bounds = [(0, None) for _ in range(len(f0))]
-        
-        #perform the optimization
+        def objective_function(params_vec):
+            p = np.copy(params_vec)
+            if fit_beta:
+                p[0] = np.maximum(p[0], 0)
+                f_part = np.maximum(p[1:], 0)
+                f_part = f_part / np.sum(f_part) if np.sum(f_part) > 0 else f_part
+                p = np.concatenate([[p[0]], f_part])
+            else:
+                p = np.maximum(p, 0)
+                p = p / np.sum(p) if np.sum(p) > 0 else p
+            return np.sum(residuals_regularized(p, T, D, D2, alpha)**2)
+
+        if fit_beta:
+            f0 = np.concatenate([[beta_init], np.ones(T.shape[1]) / T.shape[1]])
+            bounds = [(0.0, 2.0)] + [(0, None)] * T.shape[1]
+            constraint = {'type': 'eq', 'fun': lambda p: np.sum(p[1:]) - 1.0}
+        else:
+            f0 = np.ones(T.shape[1]) / T.shape[1]
+            bounds = [(0, None)] * T.shape[1]
+            constraint = {'type': 'eq', 'fun': lambda p: np.sum(p) - 1.0}
+
         result = minimize(
-            objective_function,
-            f0,
-            method='SLSQP',  # Sequential Least Squares Programming
-            bounds=bounds,
-            constraints=constraint,
+            objective_function, f0, method='SLSQP',
+            bounds=bounds, constraints=constraint,
             options={'ftol': 1e-8, 'disp': False, 'maxiter': 1000}
         )
-        f_optimized = result.x
-        
-        #ensure the result is normalized
+
+        if fit_beta:
+            beta_fitted = result.x[0]
+            f_optimized = result.x[1:]
+        else:
+            beta_fitted = 1.0
+            f_optimized = result.x
         f_optimized = f_optimized / np.sum(f_optimized) if np.sum(f_optimized) > 0 else f_optimized
-        
+
     else:
-        #without normalization, use simpler approach
-        #initial guess for f - uniform distribution
-        f0 = np.ones(T.shape[1])
-        
-        #perform the non-negative least squares optimization with regularization
-        bounds = (0, np.inf)  # Non-negativity constraint
+        if fit_beta:
+            f0 = np.concatenate([[beta_init], np.ones(T.shape[1])])
+            lb = np.concatenate([[0.0], np.zeros(T.shape[1])])
+            ub = np.concatenate([[2.0], np.full(T.shape[1], np.inf)])
+            bounds = (lb, ub)
+        else:
+            f0 = np.ones(T.shape[1])
+            bounds = (0, np.inf)
+
         result = least_squares(
-            lambda f: residuals_regularized(f, T, D, D2, alpha), 
-            f0, 
-            bounds=bounds,
-            method='trf',  # Trust Region Reflective algorithm
-            ftol=1e-8,     # function tolerance for convergence
-            xtol=1e-8      # parameter tolerance for convergence
+            lambda p: residuals_regularized(p, T, D, D2, alpha),
+            f0, bounds=bounds, method='trf', ftol=1e-8, xtol=1e-8
         )
-        f_optimized = result.x
-    
+
+        if fit_beta:
+            beta_fitted = result.x[0]
+            f_optimized = result.x[1:]
+        else:
+            beta_fitted = 1.0
+            f_optimized = result.x
+
     #calculate the optimized function values
-    optimized_values = (T @ f_optimized)**2
+    optimized_values = beta_fitted * (T @ f_optimized)**2
     residuals_values = optimized_values - D
-    
+
     #find peaks
     peaks, peak_properties = find_peaks(f_optimized, prominence=prominence, distance=distance, width=0)
      
@@ -410,7 +413,8 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
 
     #4-panel layout: data+fit | distribution | residuals | Q-Q
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(24, 6))
-    fig.suptitle(f'[{plot_number}]: Regularized — {name}', fontsize=12)
+    beta_label = f', β={beta_fitted:.3f}' if fit_beta else ''
+    fig.suptitle(f'[{plot_number}]: Regularized — {name}{beta_label}', fontsize=12)
 
     # Panel 1: data + fit
     ax1.semilogx(tau, D, 'o', alpha=0.6, markersize=4, label='Data')
@@ -472,7 +476,7 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     plt.show()
     
     #prepare results for this dataframe
-    results = {'filename': name, 'R_squared': r_squared}
+    results = {'filename': name, 'R_squared': r_squared, 'beta': beta_fitted}
     for i, peak_index in enumerate(peaks):
         #tau: maximum or centroid depending on peak_method
         if peak_method == 'centroid' and f'peak_{i+1}' in peak_stats:
@@ -531,10 +535,12 @@ def nnls_reg_simple(df, name, nnls_reg_params):
     prominence = nnls_reg_params.get('prominence', 0.01)
     distance = nnls_reg_params.get('distance', 1)
     alpha = nnls_reg_params.get('alpha', 0.01)
-    
+    fit_beta = nnls_reg_params.get('fit_beta', False)
+
     #create the vectors
     tau = df['t [s]'].to_numpy()
     D = df['g(2)-1'].to_numpy()
+    beta_init = float(np.max(D[:min(5, len(D))])) if fit_beta else 1.0
     
     #create grid of tau and decay time combinations
     decay_times_N, tau_M = np.meshgrid(decay_times, tau)
@@ -553,45 +559,52 @@ def nnls_reg_simple(df, name, nnls_reg_params):
     D2 = create_tikhonov_matrix(n)
     
     #define the regularized objective function
-    def residuals_regularized(f, T, D, D2, alpha):
-        #g(2)(τ)-1 = (∑_i A_i * exp(-τ/τ_i))^2
-        model_output = (T @ f)**2
-        
-        #data fidelity residuals
+    def residuals_regularized(params_vec, T, D, D2, alpha):
+        if fit_beta:
+            beta_val = params_vec[0]
+            f = params_vec[1:]
+        else:
+            beta_val = 1.0
+            f = params_vec
+        model_output = beta_val * (T @ f)**2
         fit_residuals = model_output - D
-        
-        #smoothness
         smoothness_penalty = alpha * (D2 @ f)
         return np.concatenate([fit_residuals, smoothness_penalty])
-    
-    #initial guess (uniform distribution)
-    f0 = np.ones(T.shape[1])
-    
-    #perform nnls
-    bounds = (0, np.inf)  # Non-negativity Constraint !
+
+    if fit_beta:
+        f0 = np.concatenate([[beta_init], np.ones(T.shape[1])])
+        lb = np.concatenate([[0.0], np.zeros(T.shape[1])])
+        ub = np.concatenate([[2.0], np.full(T.shape[1], np.inf)])
+        bounds = (lb, ub)
+    else:
+        f0 = np.ones(T.shape[1])
+        bounds = (0, np.inf)
+
     result = least_squares(
-        lambda f: residuals_regularized(f, T, D, D2, alpha), 
-        f0, 
-        bounds=bounds,
-        method='trf',
-        ftol=1e-8,
-        xtol=1e-8
+        lambda p: residuals_regularized(p, T, D, D2, alpha),
+        f0, bounds=bounds, method='trf', ftol=1e-8, xtol=1e-8
     )
-    f_optimized = result.x
-    
+
+    if fit_beta:
+        beta_fitted = result.x[0]
+        f_optimized = result.x[1:]
+    else:
+        beta_fitted = 1.0
+        f_optimized = result.x
+
     #calculate the optimized function
-    optimized_values = (T @ f_optimized)**2
+    optimized_values = beta_fitted * (T @ f_optimized)**2
     residuals_values = optimized_values - D
     
     #find peaks
     peaks, _ = find_peaks(f_optimized, prominence=prominence, distance=distance, width=0)
     
     #prepare results for this dataframe
-    results = {'filename': name}
+    results = {'filename': name, 'beta': beta_fitted}
     for i, peak_index in enumerate(peaks):
         results[f'tau_{i+1}'] = decay_times[peak_index]
         results[f'intensity_{i+1}'] = f_optimized[peak_index]
-    
+
     return results, f_optimized, optimized_values, residuals_values, peaks
 
 #comparing alpha-values
