@@ -1,4 +1,19 @@
 # CHANGELOG
+
+## v2.2.1
+added functionality to fit β during regularized fit and possibility to force the fit for D-determination through the origin
+### regularized.py
+- nnls_reg() and nnls_reg_simple(): added fit_beta parameter (default False) to the nnls_reg_params dict. When True, the Siegert coherence factor β is included as a free parameter in the optimisation, changing the forward model from (T@f)² to β·(T@f)². β is bounded [0, 2] and initialised from the amplitude of the observed autocorrelation. The fitted β is reported in the plot title and returned in the results dict. The plain nnls() function is unchanged.
+
+---
+
+### cumulants.py
+
+- analyze_diffusion_coefficient(): added fit_through_origin parameter (default False). When True, the free-intercept OLS is replaced entirely by an analytical forced-through-origin regression (D = Σ(xᵢyᵢ)/Σ(xᵢ²)). All statistics — slope, SE, R², residuals, skewness, kurtosis, Jarque-Bera p-value, normality classification — are derived exclusively from this fit. The free-intercept OLS is not computed. The q²_coef and q²_se columns used for downstream Rh calculation are set to the forced-fit values, so no downstream cells require changes when toggling the parameter.
+
+- analyze_diffusion_coefficient(): the OLS intercept and its standard error are now always extracted and stored in the results DataFrame (intercept, intercept_se). Previously only the slope was returned explicitly. The intercept is a useful physicality check — it should be zero for pure translational diffusion — and is now shown in the annotation box on the regression plot and in all per-method and final summary tables in the notebook. When fit_through_origin=True, intercept is fixed at 0.
+
+
 ## v2.2.0
 improved cumulant_C fitting process, bug fixes and improved workflow
 ### preprocessing.py
