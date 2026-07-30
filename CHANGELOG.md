@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## v2.3.0
+reworked sls_functions_for_regularized.py
+### sls_functions_for_regularized.py
+- Removed compute_sls_data_number_weighted (the per-angle, pre-Guinier correction) entirely and the use_nw_columns option from compute_guinier_extrapolation — it now always fits the real, intensity-weighted I_pop data. Added compute_number_weighted_I0(guinier_results, rh_values, exponent) — applies the Rh^exponent correction only to the already-extrapolated I₀ per population. summarize_sls_combined now calls the new function instead of averaging synthetic _nw columns.
+
 ## v2.2.1
 added functionality to fit β during regularized fit and possibility to force the fit for D-determination through the origin
 ### regularized.py
