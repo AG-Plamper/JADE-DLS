@@ -11,18 +11,20 @@ compute_sls_data(nnls_reg_data_mod, df_intensity, n_populations)
     area-fraction decomposition:
     I_pop = I_total * normalized_area_percent_N / 100
 
-compute_sls_data_number_weighted(sls_data, n_populations, rh_values, exponent)
-    number-fraction correction:
-    c_pop = I_pop / Rh^exponent → normalised → I_pop_nw = I_total * c_frac
-    Removes the Rh^exponent intensity bias to give number-weighted fractions.
-
 compute_guinier_total(sls_data, q2_range)
     Guinier fit on the raw total intensity I_total vs q².
     Reference fit independent of any population decomposition.
 
 compute_guinier_extrapolation(sls_data, n_populations, q2_range)
-    Guinier analysis per population: ln(I_pop) vs q² linear fit.
-    Yields I₀ and Rg per population.
+    Guinier analysis per population: ln(I_pop) vs q² linear fit on the
+    intensity-weighted I_pop data. Yields I₀ and Rg per population.
+
+compute_number_weighted_I0(guinier_results, rh_values, exponent)
+    number-fraction correction applied only to the extrapolated I0:
+    c_i = I0_i / Rh_i^exponent → normalised → I0_i_nw = I0_total * c_frac_i
+    Guinier's law is only valid for intensity-weighted data, so the
+    Rh^exponent correction is applied after extrapolation, never to the
+    raw per-angle intensities feeding the fit.
 
 plot_sls_intensity(sls_data, n_populations, experiment_name, colors, log_y)
     I_pop vs angle per population with mean ± std error bars.
@@ -122,67 +124,6 @@ def compute_sls_data(nnls_reg_data_mod, df_intensity, n_populations):
     return sls_data
 
 
-def compute_sls_data_number_weighted(sls_data, n_populations, rh_values,
-                                      exponent=6):
-    """
-    number/concentration-fraction correction.
-
-    Converts the intensity-weighted I_popN (from area fractions)
-    to number-weighted intensities using the DLS-derived Rh per population:
-
-        c_pop_i  = I_pop_i  /  Rh_i ^ exponent        (per file)
-        c_frac_i = c_pop_i  /  sum_j(c_pop_j)          (normalised, per file)
-        I_pop_i_nw = I_total * c_frac_i                 (number-weighted intensity)
-
-    This follows: c ~ I / R^exponent
-        exponent = 5  Daoud-Cotton scaling for star polymers (M ~ R^5)
-        exponent = 6  Rayleigh scattering for compact spheres (I ~ R^6)
-
-    The correction is applied per file, so file-to-file variation in the
-    area fractions is preserved but the Rh^exponent bias is removed.
-    The small population is no longer suppressed by the size ratio.
-    """
-    #validate that Method A columns exist
-    for i in range(1, n_populations + 1):
-        if f'I_pop{i} [kHz]' not in sls_data.columns:
-            print(f"Error: 'I_pop{i} [kHz]' not found — run compute_sls_data first.")
-            return sls_data
-
-    #per-file number-fraction correction
-    c_cols = []
-    for i in range(1, n_populations + 1):
-        rh = rh_values.get(i, np.nan)
-        if np.isnan(rh) or rh <= 0:
-            print(f"Warning: invalid Rh for population {i} — skipped.")
-            sls_data[f'c_pop{i}_rel'] = np.nan
-        else:
-            sls_data[f'c_pop{i}_rel'] = sls_data[f'I_pop{i} [kHz]'] / (rh ** exponent)
-        c_cols.append(f'c_pop{i}_rel')
-
-    #normalise to get per-file concentration fractions
-    c_total = sls_data[c_cols].sum(axis=1).replace(0, np.nan)
-    for i in range(1, n_populations + 1):
-        if f'c_pop{i}_rel' not in sls_data.columns:
-            continue
-        c_frac = sls_data[f'c_pop{i}_rel'] / c_total
-        sls_data[f'I_pop{i}_nw [kHz]'] = sls_data['MeanCR_corr [kHz]'] * c_frac
-
-    #report mean fractions for reference
-    print(f"\nnumber-fraction correction (exponent={exponent})")
-    print(f"{'Population':<12} {'Rh [nm]':<12} {'Mean I_frac (A)':<18} {'Mean c_frac (B)':<18}")
-    for i in range(1, n_populations + 1):
-        rh    = rh_values.get(i, np.nan)
-        i_col = f'I_pop{i} [kHz]'
-        nw_col= f'I_pop{i}_nw [kHz]'
-        i_frac = (sls_data[i_col] / sls_data['MeanCR_corr [kHz]']).mean() * 100 \
-                 if i_col in sls_data.columns else np.nan
-        c_frac = (sls_data[nw_col] / sls_data['MeanCR_corr [kHz]']).mean() * 100 \
-                 if nw_col in sls_data.columns else np.nan
-        print(f"  Pop {i:<8} {rh:<12.1f} {i_frac:<18.1f} {c_frac:<18.1f}")
-
-    return sls_data
-
-
 # ── Guinier functions ─────────────────────────────────────────────────────────
 
 def compute_guinier_total(sls_data, q2_range=None):
@@ -222,12 +163,16 @@ def compute_guinier_total(sls_data, q2_range=None):
     return _guinier_fit(grouped, grouped_fit, "Total intensity")
 
 
-def compute_guinier_extrapolation(sls_data, n_populations, q2_range=None,
-                                   use_nw_columns=False):
+def compute_guinier_extrapolation(sls_data, n_populations, q2_range=None):
     """
     Guinier analysis per population: ln(I_pop) vs q² linear fit.
 
         ln I(q) = ln I₀  −  (Rg²/3) · q²
+
+    Always fit on the intensity-weighted I_popN [kHz] columns (Method A).
+    Guinier's law describes real scattered intensity, so the Rh^exponent
+    number-weighting correction must never be applied before this fit —
+    see compute_number_weighted_I0 for the post-extrapolation correction.
 
     Parameters
     ----------
@@ -237,9 +182,6 @@ def compute_guinier_extrapolation(sls_data, n_populations, q2_range=None,
         - None             : use all angles for all populations
         - (q2_min, q2_max) : same range applied to all populations
         - {1: (a, b), 2: (c, d), ...} : per-population ranges
-    use_nw_columns : bool
-        If True, use I_popN_nw [kHz] columns (Method B, number-weighted)
-        instead of I_popN [kHz] (Method A, intensity-weighted).
 
     Returns
     -------
@@ -247,10 +189,9 @@ def compute_guinier_extrapolation(sls_data, n_populations, q2_range=None,
                                  grouped, grouped_fit, ln_I}
     """
     guinier_results = {}
-    col_suffix = '_nw [kHz]' if use_nw_columns else ' [kHz]'
 
     for i in range(1, n_populations + 1):
-        i_col = f'I_pop{i}{col_suffix}'
+        i_col = f'I_pop{i} [kHz]'
         if i_col not in sls_data.columns:
             print(f"Population {i}: column '{i_col}' not found — skipping.")
             continue
@@ -450,41 +391,95 @@ def summarize_sls(sls_data, guinier_results, n_populations):
     return pd.DataFrame(summary)
 
 
+def compute_number_weighted_I0(guinier_results, rh_values, exponent=6):
+    """
+    number/concentration-fraction correction applied to the extrapolated I0.
+
+    Guinier's law describes real scattered intensity, so the Rh^exponent
+    correction must be applied to the already-extrapolated, intensity-weighted
+    I0 values — never to the raw per-angle intensities that feed the Guinier
+    fit itself. Doing it beforehand would corrupt the q-dependence the fit
+    relies on (the renormalization mixes in the q-dependence of every other
+    population's area fraction, so the result no longer obeys Guinier's law).
+
+        c_i      = I0_i  /  Rh_i ^ exponent
+        c_frac_i = c_i   /  sum_j(c_j)
+        I0_i_nw  = I0_total * c_frac_i
+
+    This follows: c ~ I / R^exponent
+        exponent = 5  Daoud-Cotton scaling for star polymers (M ~ R^5)
+        exponent = 6  Rayleigh scattering for compact spheres (I ~ R^6)
+
+    Parameters
+    ----------
+    guinier_results : dict
+        Output of compute_guinier_extrapolation — guinier_results[i]['I0 [kHz]'].
+    rh_values : dict {population: Rh [nm]}
+    exponent : float
+
+    Returns
+    -------
+    dict  nw_results[i] = {'I0_nw [kHz]': ..., 'N-fraction [%]': ...}
+    """
+    c_vals = {}
+    for i, res in guinier_results.items():
+        rh = rh_values.get(i, np.nan)
+        if np.isnan(rh) or rh <= 0:
+            print(f"Warning: invalid Rh for population {i} — skipped.")
+            continue
+        c_vals[i] = res['I0 [kHz]'] / (rh ** exponent)
+
+    c_total  = sum(c_vals.values())
+    I0_total = sum(res['I0 [kHz]'] for res in guinier_results.values())
+
+    nw_results = {}
+    print(f"\nnumber-fraction correction from extrapolated I0 (exponent={exponent})")
+    print(f"{'Population':<12} {'Rh [nm]':<12} {'I0 (intensity)':<18} {'N-fraction [%]':<18}")
+    for i in guinier_results:
+        if i not in c_vals or c_total <= 0:
+            nw_results[i] = {'I0_nw [kHz]': np.nan, 'N-fraction [%]': np.nan}
+            continue
+        frac = c_vals[i] / c_total
+        nw_results[i] = {
+            'I0_nw [kHz]'    : I0_total * frac,
+            'N-fraction [%]' : frac * 100,
+        }
+        print(f"  Pop {i:<8} {rh_values.get(i, np.nan):<12.1f} "
+              f"{guinier_results[i]['I0 [kHz]']:<18.5f} {frac * 100:<18.4f}")
+
+    return nw_results
+
+
 def summarize_sls_combined(sls_data, guinier_results, total_result,
                             n_populations, rh_values, exponent=6):
     """
     Combined summary table merging intensity-weighted (Guinier) and
-    number-weighted (Steinschulte) results per population, plus a total row.
+    number-weighted results per population, plus a total row.
+
+    The Rh^exponent number-weighting is applied only to the extrapolated I0
+    values (see compute_number_weighted_I0), never to the raw per-angle
+    intensities — Guinier's law is only valid for intensity-weighted data.
 
     Columns
     -------
     Population      : population index
     Rh [nm]         : DLS-derived hydrodynamic radius
-    I-fraction [%]  : mean intensity fraction from area-percent decomposition
-    N-fraction [%]  : number/concentration fraction after Rh^exponent correction
+    I-fraction [%]  : mean intensity fraction from area-percent decomposition (diagnostic)
     I0 (intensity)  : I₀ extrapolated from per-population Guinier fit
-    I0 (number)     : I₀_total * N-fraction  (no fit — analytically derived)
+    N-fraction [%]  : number/concentration fraction after Rh^exponent correction of I0
+    I0 (number)     : I₀_total(intensity) * N-fraction  (no fit — analytically derived)
     Rg [nm]         : radius of gyration from Guinier fit
     qRg_max         : validity indicator (should be < 1.3)
     R_squared       : Guinier fit quality
     """
-    I0_total = total_result['I0 [kHz]'] if total_result is not None else np.nan
-
-    # compute per-file number fractions from _nw columns if available,
-    # otherwise recompute from I_pop and rh_values
-    nw_available = all(
-        f'I_pop{i}_nw [kHz]' in sls_data.columns
-        for i in range(1, n_populations + 1)
-    )
+    I0_total   = total_result['I0 [kHz]'] if total_result is not None else np.nan
+    nw_results = compute_number_weighted_I0(guinier_results, rh_values, exponent=exponent)
 
     rows = []
     for i in range(1, n_populations + 1):
-        row = {'Population': i}
+        row = {'Population': i, 'Rh [nm]': rh_values.get(i, np.nan)}
 
-        # Rh from DLS
-        row['Rh [nm]'] = rh_values.get(i, np.nan)
-
-        # intensity fraction from Method A area columns
+        # intensity fraction from Method A area columns (diagnostic only)
         i_col = f'I_pop{i} [kHz]'
         if i_col in sls_data.columns and 'MeanCR_corr [kHz]' in sls_data.columns:
             valid = sls_data['MeanCR_corr [kHz]'] > 0
@@ -495,39 +490,18 @@ def summarize_sls_combined(sls_data, guinier_results, total_result,
         else:
             row['I-fraction [%]'] = np.nan
 
-        # number fraction from _nw columns
-        nw_col = f'I_pop{i}_nw [kHz]'
-        if nw_available and 'MeanCR_corr [kHz]' in sls_data.columns:
-            valid = sls_data['MeanCR_corr [kHz]'] > 0
-            row['N-fraction [%]'] = (
-                sls_data.loc[valid, nw_col] /
-                sls_data.loc[valid, 'MeanCR_corr [kHz]']
-            ).mean() * 100
-        else:
-            # recompute analytically if _nw columns missing
-            rh = rh_values.get(i, np.nan)
-            if not np.isnan(rh) and rh > 0:
-                c_vals = {
-                    j: (sls_data[f'I_pop{j} [kHz]'] / (rh_values[j] ** exponent)).mean()
-                    for j in range(1, n_populations + 1)
-                    if f'I_pop{j} [kHz]' in sls_data.columns and rh_values.get(j, 0) > 0
-                }
-                c_total = sum(c_vals.values())
-                row['N-fraction [%]'] = c_vals.get(i, np.nan) / c_total * 100 \
-                    if c_total > 0 else np.nan
-            else:
-                row['N-fraction [%]'] = np.nan
-
-        # Guinier results (intensity-weighted)
         if i in guinier_results:
             res = guinier_results[i]
+            nw  = nw_results.get(i, {})
             row['I0 (intensity) [kHz]'] = res['I0 [kHz]']
-            row['I0 (number) [kHz]']    = I0_total * row['N-fraction [%]'] / 100
+            row['N-fraction [%]']       = nw.get('N-fraction [%]', np.nan)
+            row['I0 (number) [kHz]']    = nw.get('I0_nw [kHz]', np.nan)
             row['Rg [nm]']              = res['Rg [nm]']
             row['qRg_max']              = res['qRg_max']
             row['R_squared']            = res['R2']
         else:
             row['I0 (intensity) [kHz]'] = np.nan
+            row['N-fraction [%]']       = np.nan
             row['I0 (number) [kHz]']    = np.nan
             row['Rg [nm]']              = np.nan
             row['qRg_max']              = np.nan
@@ -536,29 +510,26 @@ def summarize_sls_combined(sls_data, guinier_results, total_result,
         rows.append(row)
 
     # total row
-    total_row = {
+    rows.append({
         'Population'            : 'Total',
         'Rh [nm]'               : np.nan,
         'I-fraction [%]'        : 100.0,
-        'N-fraction [%]'        : 100.0,
         'I0 (intensity) [kHz]'  : I0_total,
+        'N-fraction [%]'        : 100.0,
         'I0 (number) [kHz]'     : I0_total,
         'Rg [nm]'               : total_result['Rg [nm]'] if total_result else np.nan,
         'qRg_max'               : total_result['qRg_max'] if total_result else np.nan,
         'R_squared'             : total_result['R2']      if total_result else np.nan,
-    }
-    rows.append(total_row)
-    
+    })
+
     df = pd.DataFrame(rows)
     return df.style.format({
         'Rh [nm]'               : '{:.1f}',
         'I-fraction [%]'        : '{:.2f}',
-        'N-fraction [%]'        : '{:.4f}',
         'I0 (intensity) [kHz]'  : '{:.5f}',
+        'N-fraction [%]'        : '{:.4f}',
         'I0 (number) [kHz]'     : '{:.5f}',
         'Rg [nm]'               : '{:.1f}',
         'qRg_max'               : '{:.3f}',
         'R_squared'             : '{:.4f}',
         }, na_rep='—')
-
-    return pd.DataFrame(rows)
