@@ -15,9 +15,10 @@ dirac_sum_g1(t, *gammas)
 dirac_sum_g2(t, beta, *gammas)
     Intensity correlation function g²(τ) = 1 + β·|g¹(τ)|² for N modes.
 
-fit_cumulant_D(x_data, y_data, n_max, beta_initial, gamma_initial, n_start)
+fit_cumulant_D(x_data, y_data, n_max, beta_initial, gamma_initial, n_start, weights=None)
     Iterative fitting from n_start to n_max exponential modes; selects
     optimal model order by AIC with convergence and residual checks.
+    weights=None (default) reproduces the exact original unweighted fit.
 
 calculate_moments_from_gammas(gammas)
     Compute mean, variance, PDI, skewness and kurtosis from a set of
@@ -28,7 +29,10 @@ cluster_gammas(gammas, gap_threshold)
 
 fit_correlations_method_D(dataframes_dict, x_col, y_col, ...)
     Apply fit_cumulant_D across all files, collect per-file results and
-    produce diagnostic plots.
+    produce diagnostic plots. Weighting is controlled entirely by whether
+    each dataframe carries a 'weight' column (see weighting.py's
+    apply_weights_to_correlations) -- absent, weights=None reproduces the
+    exact original unweighted fit.
 
 Dependencies: numpy, pandas, scipy, matplotlib
 """
@@ -86,13 +90,21 @@ def dirac_sum_g2(t, beta, *gammas):
     return beta * g1**2
 
 #fit the redefined cumulant model to autocorrelation data.
-def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=None, n_start=1):
+#weights=None (default) reproduces the exact original unweighted fit; otherwise
+#passed straight to curve_fit as sigma=1/sqrt(weights) (Levenberg-Marquardt-style
+#weighting, no change to the model itself).
+def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=None, n_start=1, weights=None):
     """
     Iteratively increases the number of Dirac delta modes (n), using previous
-    fit results as initial guesses for speed. Chooses the solution that minimizes 
+    fit results as initial guesses for speed. Chooses the solution that minimizes
     residual sum of squares while ensuring monotonicity constraints (Γᵢ > Γᵢ₋₁ > 0).
     """
-    
+    if weights is not None:
+        w = np.asarray(weights, dtype=float)
+        sigma = 1.0 / np.sqrt(w / np.mean(w))
+    else:
+        sigma = None
+
     #estimate initial gamma from data if not provided
     if gamma_initial is None:
         # Find where signal drops to ~37% (1/e)
@@ -157,29 +169,34 @@ def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=Non
             
             #perform fit
             popt, pcov = curve_fit(
-                fit_func_wrapper, 
-                x_data, 
+                fit_func_wrapper,
+                x_data,
                 y_data,
                 p0=p0,
+                sigma=sigma,
+                absolute_sigma=False,
                 bounds=(bounds_lower, bounds_upper),
                 method='trf',
                 maxfev=5000)
-            
+
             #extract fitted parameters
             beta_fit = popt[0]
             gammas_fit = np.sort(popt[1:])
-            
+
             #store for warm start
             previous_gammas = gammas_fit
-            
+
             #calculate fitted values
             g1_fit = dirac_sum_g1(x_data, *gammas_fit)
             g2_fit = beta_fit * g1_fit**2
-            
-            #calculate residuals
+
+            #calculate residuals -- residual_ss (unweighted) drives the convergence
+            #checks below unchanged; when weighted, model-order selection (best_result)
+            #uses the weighted sum instead, matching what the fit actually optimized
             residuals = y_data - g2_fit
             residual_ss = np.sum(residuals**2)
-            
+            selection_ss = np.sum((residuals / sigma) ** 2) if sigma is not None else residual_ss
+
             #store result
             result = {
                 'n_modes': n,
@@ -191,10 +208,11 @@ def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=Non
                 'convergence': 'success'
             }
             all_results.append(result)
-            
-            #update best result if this is better
-            if residual_ss < best_residual:
-                best_residual = residual_ss
+
+            #update best result if this is better (compared on the same scale
+            #the fit actually optimized -- weighted when weights are given)
+            if selection_ss < best_residual:
+                best_residual = selection_ss
                 best_result = result
             
             # === CONVERGENCE CHECKS ===
@@ -251,7 +269,7 @@ def calculate_moments_from_gammas(gammas):
     gamma_4 = np.mean(gammas**4)  # ⟨Γ⁴⟩ = (1/n)Σ Γᵢ⁴
     
     #calculate polydispersity index
-    pdi = gamma_2 / gamma_mean**2 - 1
+    pdi = gamma_2 / gamma_mean**2 - 1 if gamma_mean != 0 else float('nan')
     
     #calculate skewness
     numerator = gamma_3 - 3*gamma_2*gamma_mean + 2*gamma_mean**3
@@ -335,15 +353,22 @@ def fit_correlations_method_D(dataframes_dict, x_col='t [s]', y_col='g(2)-1',
     for name, df in dataframes_dict.items():
         try:
             fit_result = {'filename': name}
-            
+
             # Extract data
             x_data = df[x_col].values
             y_data = df[y_col].values
-            
+
+            #weighting is controlled entirely by whether df carries a 'weight'
+            #column (see weighting.py's apply_weights_to_correlations); absent,
+            #weights=None below reproduces the exact original unweighted fit.
+            is_weighted = 'weight' in df.columns
+            weights = df['weight'].values if is_weighted else None
+            fit_result['weighted'] = is_weighted
+
             # Perform fit
             print(f"\nProcessing: {name}")
-            result = fit_cumulant_D(x_data, y_data, n_max=n_max, n_start=n_start)
-            
+            result = fit_cumulant_D(x_data, y_data, n_max=n_max, n_start=n_start, weights=weights)
+
             # Store fit parameters
             fit_result['n_modes'] = result['n_modes']
             fit_result['beta'] = result['beta']
@@ -384,7 +409,8 @@ def fit_correlations_method_D(dataframes_dict, x_col='t [s]', y_col='g(2)-1',
 
                 # 3-panel layout: data+fit | residuals | Q-Q
                 fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
-                fig.suptitle(f'[{plot_number}]: Method D — {name}', fontsize=12)
+                w_label = ' [weighted]' if is_weighted else ''
+                fig.suptitle(f'[{plot_number}]: Method D{w_label} — {name}', fontsize=12)
 
                 # Panel 1: data + fit
                 ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')

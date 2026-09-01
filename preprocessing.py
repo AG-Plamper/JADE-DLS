@@ -80,16 +80,59 @@ def extract_data(file_path):
         #extract viscosity
         viscosity = None
         for line in lines:
-          if "Viscosity [cp]  :" in line: 
+          if "Viscosity [cp]  :" in line:
             try:
-              viscosity = float(line.split(":")[1].strip()) 
-              break 
+              viscosity = float(line.split(":")[1].strip())
+              break
             except (ValueError, IndexError):
               print(f"Error extracting viscosity from {file_path}")
 
+        #extract duration (measuring time, used by weighting.py's noise model)
+        duration = None
+        for line in lines:
+          if "Duration [s]" in line:
+            try:
+              duration = float(line.split(":")[1].strip())
+              break
+            except (ValueError, IndexError):
+              print(f"Error extracting duration from {file_path}")
+
+        #extract MeanCR0/MeanCR1 (detector count rates, used by weighting.py's
+        #noise model and for angle-resolved SLS intensity, formerly intensity.py)
+        meancr0 = None
+        for line in lines:
+          if "MeanCR0 [kHz]" in line:
+            try:
+              meancr0 = float(line.split(":")[1].strip())
+              break
+            except (ValueError, IndexError):
+              print(f"Error extracting MeanCR0 from {file_path}")
+
+        meancr1 = None
+        for line in lines:
+          if "MeanCR1 [kHz]" in line:
+            try:
+              meancr1 = float(line.split(":")[1].strip())
+              break
+            except (ValueError, IndexError):
+              print(f"Error extracting MeanCR1 from {file_path}")
+
+        #extract monitor diode reading (used for SLS intensity normalization)
+        monitordiode = None
+        for line in lines:
+          if "Monitor Diode" in line:
+            try:
+              #split by whitespace and get the last element
+              monitordiode = float(line.split()[-1])
+              break
+            except (ValueError, IndexError):
+              print(f"Error extracting monitor diode from {file_path}")
+
         #create DataFrame
-        data = {'angle [°]': [angle], 'temperature [K]': [temperature], 'wavelength [nm]': [wavelength], 
-                'refractive_index': [refractive_index], 'viscosity [cp]': [viscosity]}
+        data = {'angle [°]': [angle], 'temperature [K]': [temperature], 'wavelength [nm]': [wavelength],
+                'refractive_index': [refractive_index], 'viscosity [cp]': [viscosity],
+                'duration [s]': [duration], 'meancr0 [kHz]': [meancr0], 'meancr1 [kHz]': [meancr1],
+                'monitordiode [cps]': [monitordiode]}
         return pd.DataFrame(data)
       
     except UnicodeDecodeError:
@@ -524,3 +567,22 @@ def process_correlation_data(input_dict, columns_to_remove = None):
             continue
 
     return output_dict
+
+#plot mean intensities vs angle (formerly intensity.py's plot_meancr, moved
+#here since MeanCR0/MeanCR1 are now extracted by extract_data() above)
+def plot_meancr(df, x_col, y_col, title='', figsize=(8, 4), save_path=None):
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.scatter(df[x_col], df[y_col], alpha=0.7, s=50)
+    ax.set_xlabel('angle [°]')
+    ax.set_ylabel('corrected mean intensity [kHz]')
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    plt.show()
+
+    return fig, ax

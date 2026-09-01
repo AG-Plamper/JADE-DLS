@@ -32,6 +32,9 @@ plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_limi
                                       initial_guesses, ...)
     Fit and plot all datasets. Dispatches to adaptive or expert mode based on
     whether initial_guesses is a dict or list. Returns a DataFrame of results.
+    Weighting is controlled entirely by whether each dataframe carries a
+    'weight' column (see weighting.py's apply_weights_to_correlations) --
+    absent, sigma=None reproduces the exact original unweighted fit.
 
 Dependencies: numpy, pandas, scipy, matplotlib
 """
@@ -183,8 +186,21 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             x_data = df['t [s]']
             y_data = df['g(2)-1']
 
-            x_fit = x_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
-            y_fit = y_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
+            fit_mask = (x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])
+            x_fit = x_data[fit_mask]
+            y_fit = y_data[fit_mask]
+
+            #weighting is controlled entirely by whether df carries a 'weight'
+            #column (see weighting.py's apply_weights_to_correlations); absent,
+            #sigma=None below reproduces the exact original unweighted fit.
+            is_weighted = 'weight' in df.columns
+            if is_weighted:
+                w_full = df['weight'].to_numpy()
+                w_fit = w_full[fit_mask.to_numpy()]
+                sigma_fit = 1.0 / np.sqrt(w_fit / np.mean(w_fit))
+            else:
+                sigma_fit = None
+            fit_result['weighted'] = is_weighted
 
             if len(x_fit) < 2:
                 print(f"Not enough data points in the specified range for fitting {name}. Skipping.")
@@ -198,21 +214,28 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             def _metrics(popt):
                 yc     = fit_function2(x_fit, *popt)
                 res    = y_fit - yc
-                ss_res = np.sum(res**2)
-                ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
+                if is_weighted:
+                    w_arr  = sigma_fit ** -2
+                    ss_res = np.sum(w_arr * res**2)
+                    y_wmean = np.average(y_fit, weights=w_arr)
+                    ss_tot = np.sum(w_arr * (y_fit - y_wmean)**2)
+                else:
+                    ss_res = np.sum(res**2)
+                    ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
                 r2     = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
                 n      = len(y_fit)
                 k      = len(popt) + 1
-                return r2, float(np.sqrt(ss_res / n)), float(n * np.log(ss_res / n) + 2 * k)
+                return r2, float(np.sqrt(np.sum(res**2) / n)), float(n * np.log(np.sum(res**2) / n) + 2 * k)
 
             def _do_fit(p0, maxfev_override=None):
                 mfev = maxfev_override if maxfev_override is not None else maxfev
                 if method == 'lm':
-                    return curve_fit(fit_function2, x_fit, y_fit, p0=p0, maxfev=mfev)
+                    return curve_fit(fit_function2, x_fit, y_fit, p0=p0, sigma=sigma_fit,
+                                     absolute_sigma=False, maxfev=mfev)
                 bounds = ([_BOUNDS_LOWER[pn] for pn in param_names],
                           [_BOUNDS_UPPER[pn] for pn in param_names])
-                return curve_fit(fit_function2, x_fit, y_fit, p0=p0,
-                                 method=method, bounds=bounds, maxfev=mfev)
+                return curve_fit(fit_function2, x_fit, y_fit, p0=p0, sigma=sigma_fit,
+                                 absolute_sigma=False, method=method, bounds=bounds, maxfev=mfev)
 
             best_popt = None
             best_pcov = None
@@ -365,7 +388,8 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
             mode_str = (f'adaptive ({len(all_r_squared)} attempts)'
                         if _is_adaptive else f'expert (iter {best_idx+1})')
             fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
-            fig.suptitle(f'[{plot_number}]: Method C ({fit_function2.__name__}) — {name}', fontsize=12)
+            w_label = ' [weighted]' if is_weighted else ''
+            fig.suptitle(f'[{plot_number}]: Method C{w_label} ({fit_function2.__name__}) — {name}', fontsize=12)
 
             ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')
             for i, (popt_i, y_i) in enumerate(all_y_fits):

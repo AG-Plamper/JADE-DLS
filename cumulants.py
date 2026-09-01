@@ -25,6 +25,9 @@ remove_rows_by_index(df, indices_str)
 plot_processed_correlations(dataframes_dict, fit_x_limits, xlim, ylim)
     OLS linear fit to ln√(g²−1) within a user-defined time window,
     3-panel plot (data+fit | residuals | Q-Q) per correlation file.
+    Weighting is controlled entirely by whether each dataframe carries a
+    'weight' column (see weighting.py's apply_weights_to_correlations) --
+    absent, the exact original unweighted (linregress-based) fit runs.
 
 Dependencies: numpy, pandas, scipy, matplotlib, statsmodels
 """
@@ -427,10 +430,13 @@ def remove_rows_by_index(df, indices_str):
     return df
 
 #plot and fit for method B
+#weighting is controlled entirely by whether df carries a 'weight' column
+#(see weighting.py's apply_weights_to_correlations) -- when absent, the
+#exact original unweighted (linregress-based) path runs unchanged.
 def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=None):
     all_fit_results = []
     plot_number = 1
-    
+
     for name, df in dataframes_dict.items():
         if df is None:
             print(f"Skipping '{name}': no data (None).")
@@ -441,10 +447,33 @@ def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=N
             #main processing
             x_data = df['t [s]']
             y_data = df['g(2)_mod']
-            x_fit = x_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
-            y_fit = y_data[(x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])]
-            
-            slope, intercept, r, p, se = linregress(x_fit, y_fit)
+            fit_mask = (x_data >= fit_x_limits[0]) & (x_data <= fit_x_limits[1])
+            x_fit = x_data[fit_mask]
+            y_fit = y_data[fit_mask]
+
+            is_weighted = 'weight' in df.columns
+            if is_weighted:
+                #weight propagation via the delta method: y=0.5*ln(x) => Var(y) ~
+                #Var(x)/(2x)^2, so w_y = w_x*(2x)^2 (x = g(2)-1, the pre-log data)
+                w_x = df['weight'].to_numpy()
+                w_log_full = w_x * (2.0 * df['g(2)-1'].to_numpy()) ** 2
+                w_log_full = w_log_full / np.mean(w_log_full)
+                w_fit = w_log_full[fit_mask.to_numpy()]
+
+                Sw = np.sum(w_fit)
+                Swx = np.sum(w_fit * x_fit)
+                Swy = np.sum(w_fit * y_fit)
+                Swxx = np.sum(w_fit * x_fit ** 2)
+                Swxy = np.sum(w_fit * x_fit * y_fit)
+                denom = Sw * Swxx - Swx ** 2
+                slope = (Sw * Swxy - Swx * Swy) / denom
+                intercept = (Swxx * Swy - Swx * Swxy) / denom
+                se = np.nan  # weighted slope std-error not derived here
+
+                y_wmean = np.average(y_fit, weights=w_fit)
+                weighted_ss_tot = np.sum(w_fit * (y_fit - y_wmean) ** 2)
+            else:
+                slope, intercept, r, p, se = linregress(x_fit, y_fit)
 
             # Γ = -slope,  a = exp(2 * intercept)
             Gamma = -slope
@@ -454,20 +483,26 @@ def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=N
             fit_result['Gamma_error']         = se          # std error of slope
             fit_result['Gamma_relative_error']= (se / abs(Gamma)) * 100 if Gamma != 0 else np.inf
             fit_result['a']                   = a
+            fit_result['weighted']            = is_weighted
 
             # generate fit curve over full x range
             y_fit_values = slope * x_data + intercept
 
             # residuals
             residuals = y_fit - (slope * x_fit + intercept)
-            ss_res = np.sum(residuals**2)
-            ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
-            r_squared = 1 - (ss_res / ss_tot)
+            if is_weighted:
+                weighted_ss_res = np.sum(w_fit * residuals ** 2)
+                r_squared = 1 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot != 0 else np.nan
+            else:
+                ss_res = np.sum(residuals**2)
+                ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
+                r_squared = 1 - (ss_res / ss_tot)
             fit_result['R_squared'] = r_squared
-                
+
             #3-panel layout: data+fit | residuals | Q-Q
             fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
-            fig.suptitle(f'[{plot_number}]: Method B — {name}', fontsize=12)
+            w_label = ' [weighted]' if is_weighted else ''
+            fig.suptitle(f'[{plot_number}]: Method B{w_label} — {name}', fontsize=12)
 
             #panel 1: data + fit
             ax1.plot(x_data, y_data, 'o', alpha=0.6, markersize=4, label='Data')

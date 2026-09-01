@@ -8,9 +8,12 @@ computes per-peak hydrodynamic radii and shape statistics.
 
 Functions
 ---------
-nnls(df, name, nnls_params, plot_number)
+nnls(df, name, nnls_params, plot_number, weights=None)
     Plain NNLS fit of g²(τ) to a discrete set of exponential basis
-    functions; returns peak positions and amplitudes.
+    functions; returns peak positions and amplitudes. weights=None
+    (default) reproduces the plain unweighted fit exactly; otherwise (or
+    via an auto-detected 'weight' column on df) the residual is scaled
+    by sqrt(weights), same convention as nnls_reg.
 
 nnls_all(dataframes_dict, nnls_params)
     Apply nnls() across all files and collect results.
@@ -18,15 +21,21 @@ nnls_all(dataframes_dict, nnls_params)
 calculate_decay_rates(df, tau_columns)
     Convert decay-time columns to decay rates Γ = 1/τ.
 
-nnls_reg(df, name, nnls_reg_params, plot_number)
+nnls_reg(df, name, nnls_reg_params, plot_number, weights=None)
     Tikhonov-regularized NNLS fit with automatic or fixed regularization
     parameter α; detects peaks, computes area fractions, centroids, FWHM,
     skewness and excess kurtosis per peak; 4-panel diagnostic plot.
+    weights=None (default) reproduces the plain unweighted fit exactly;
+    otherwise (or via an auto-detected 'weight' column on df -- see
+    weighting.py) the data-fidelity residual is scaled by sqrt(weights)
+    per Biganzoli & Ferri (2018), correcting for per-channel noise.
 
 nnls_reg_all(dataframes_dict, nnls_reg_params)
-    Apply nnls_reg() across all files and collect results.
+    Apply nnls_reg() across all files and collect results. Weighting is
+    controlled entirely by which dict is passed in (see weighting.py's
+    apply_weights_to_correlations) -- no separate parameter needed here.
 
-nnls_reg_simple(df, name, nnls_reg_params)
+nnls_reg_simple(df, name, nnls_reg_params, weights=None)
     Simplified variant of nnls_reg without plotting, used for α-grid search.
 
 analyze_random_datasets_grid(df_dict, num_datasets, base_nnls_params, ...)
@@ -56,25 +65,39 @@ from matplotlib import cm
 import random
 
 #code for simple NNLS-Fit to the data
-def nnls(df, name, nnls_params, plot_number):
+#weights=None (default) reproduces the unweighted fit exactly. If weights is not
+#given explicitly, a 'weight' column on df is auto-detected and used instead --
+#same convention as nnls_reg (see there).
+def nnls(df, name, nnls_params, plot_number, weights=None):
     decay_times = nnls_params['decay_times']
     prominence = nnls_params['prominence']
     distance = nnls_params['distance']
-    
+
     #create the vectors
     tau = df['t [s]'].to_numpy()
     D = df['g(2)-1'].to_numpy()
-    
+
+    #auto-detect a weight column when weights isn't given explicitly
+    if weights is None and 'weight' in df.columns:
+        weights = df['weight'].to_numpy()
+    if weights is None:
+        sqrt_w = np.ones_like(tau)
+        is_weighted = False
+    else:
+        w = np.asarray(weights, dtype=float)
+        sqrt_w = np.sqrt(w / np.mean(w))
+        is_weighted = True
+
     #create grid of tau and decay time combinations
     decay_times_N, tau_M = np.meshgrid(decay_times, tau)
-    
+
     #create matrix A from the mesh
     T = np.exp(-tau_M / decay_times_N)
-    
+
     #define the residual function
     def residuals(f, T, D):
-        return (T @ f)**2 - D
-    
+        return sqrt_w * ((T @ f)**2 - D)
+
     #initial guess for f
     f0 = np.ones(T.shape[1])
     
@@ -102,10 +125,15 @@ def nnls(df, name, nnls_params, plot_number):
     ss_res = np.sum(residuals_values**2)
     ss_tot = np.sum((D - np.mean(D))**2)
     r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+    weighted_ss_res = np.sum((sqrt_w * residuals_values)**2)
+    weighted_ss_tot = np.sum((sqrt_w * (D - np.mean(D)))**2)
+    weighted_r_squared = 1 - (weighted_ss_res / weighted_ss_tot) if weighted_ss_tot != 0 else 0
 
-    #4-panel layout: data+fit | distribution | residuals | Q-Q
+    #4-panel layout: data+fit | distribution | residuals | Q-Q -- identical
+    #layout whether weighted or not (see nnls_reg for the same convention)
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(24, 6))
-    fig.suptitle(f'[{plot_number}]: NNLS — {name}', fontsize=12)
+    w_label = ' [weighted]' if is_weighted else ''
+    fig.suptitle(f'[{plot_number}]: NNLS{w_label} — {name}', fontsize=12)
 
     # Panel 1: data + fit
     ax1.semilogx(tau, D, 'o', alpha=0.6, markersize=4, label='Data')
@@ -146,9 +174,11 @@ def nnls(df, name, nnls_params, plot_number):
     plt.show()
     
     #prepare results for this dataframe
-    results = {'filename': name, 'f_optimized': f_optimized}
-    
+    results = {'filename': name}
+
     results['R_squared'] = r_squared
+    results['weighted_R_squared'] = weighted_r_squared
+    results['weighted'] = is_weighted
     for i, peak_index in enumerate(peaks):
         percentage = normalized_amplitudes_sum[i] * 100
         results[f'tau_{i+1}'] = decay_times[peak_index]
@@ -179,7 +209,11 @@ def calculate_decay_rates(df, tau_columns):
     return df
 
 #regularized fit
-def nnls_reg(df, name, nnls_reg_params, plot_number):
+#weights=None (default) reproduces the unweighted fit exactly. If weights is not
+#given explicitly, a 'weight' column on df is auto-detected and used instead --
+#this is how weighting.py's processed_correlations_weighted plugs in without any
+#other call site needing to change; see weighting.py's module docstring.
+def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
     decay_times = nnls_reg_params['decay_times']
     prominence = nnls_reg_params.get('prominence', 0.01)  #default to a very low prominence
     distance = nnls_reg_params.get('distance', 1)  #default to minimum distance
@@ -192,6 +226,18 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     #the vectors
     tau = df['t [s]'].to_numpy()
     D = df['g(2)-1'].to_numpy()
+
+    #auto-detect a weight column when weights isn't given explicitly
+    if weights is None and 'weight' in df.columns:
+        weights = df['weight'].to_numpy()
+
+    if weights is None:
+        sqrt_w = np.ones_like(tau)
+        is_weighted = False
+    else:
+        w = np.asarray(weights, dtype=float)
+        sqrt_w = np.sqrt(w / np.mean(w))
+        is_weighted = True
 
     #initial beta estimate from the first few data points (g²(0)-1 ≈ β)
     beta_init = float(np.max(D[:min(5, len(D))])) if fit_beta else 1.0
@@ -224,7 +270,7 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
             f = f / np.sum(f) if np.sum(f) > 0 else f
         # Model: g(2)(τ)-1 = β · (∑_i A_i · exp(-τ/τ_i))²
         model_output = beta_val * (T @ f)**2
-        fit_residuals = model_output - D
+        fit_residuals = sqrt_w * (model_output - D)
         all_residuals = [fit_residuals]
         smoothness_penalty = alpha * (D2 @ f)
         all_residuals.append(smoothness_penalty)
@@ -410,11 +456,20 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
     ss_res = np.sum(residuals_values**2)
     ss_tot = np.sum((D - np.mean(D))**2)
     r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+    #weighted R² (only meaningful when is_weighted; matches the metric the fit
+    #was actually optimizing against)
+    weighted_ss_res = np.sum((sqrt_w * residuals_values)**2)
+    weighted_ss_tot = np.sum((sqrt_w * (D - np.mean(D)))**2)
+    weighted_r_squared = 1 - (weighted_ss_res / weighted_ss_tot) if weighted_ss_tot != 0 else 0
 
-    #4-panel layout: data+fit | distribution | residuals | Q-Q
+    #4-panel layout: data+fit | distribution | residuals | Q-Q -- identical
+    #layout whether weighted or not, only the title tag and the underlying
+    #numbers differ (weighted_R_squared/weighted are still in the returned
+    #results dict for anyone who wants them, just not a separate panel)
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(24, 6))
     beta_label = f', β={beta_fitted:.3f}' if fit_beta else ''
-    fig.suptitle(f'[{plot_number}]: Regularized — {name}{beta_label}', fontsize=12)
+    w_label = ' [weighted]' if is_weighted else ''
+    fig.suptitle(f'[{plot_number}]: Regularized{w_label} — {name}{beta_label}', fontsize=12)
 
     # Panel 1: data + fit
     ax1.semilogx(tau, D, 'o', alpha=0.6, markersize=4, label='Data')
@@ -474,9 +529,10 @@ def nnls_reg(df, name, nnls_reg_params, plot_number):
 
     plt.tight_layout()
     plt.show()
-    
+
     #prepare results for this dataframe
-    results = {'filename': name, 'R_squared': r_squared, 'beta': beta_fitted}
+    results = {'filename': name, 'R_squared': r_squared, 'beta': beta_fitted,
+               'weighted_R_squared': weighted_r_squared, 'weighted': is_weighted}
     for i, peak_index in enumerate(peaks):
         #tau: maximum or centroid depending on peak_method
         if peak_method == 'centroid' and f'peak_{i+1}' in peak_stats:
@@ -530,7 +586,9 @@ def nnls_reg_all(dataframes_dict, nnls_reg_params):
     return nnls_reg_df, full_results
 
 #simple variant of nnls_reg for alpha-comparison
-def nnls_reg_simple(df, name, nnls_reg_params):
+#weights=None (default) reproduces the unweighted fit exactly; a 'weight' column
+#on df is auto-detected otherwise -- same convention as nnls_reg (see there).
+def nnls_reg_simple(df, name, nnls_reg_params, weights=None):
     decay_times = nnls_reg_params['decay_times']
     prominence = nnls_reg_params.get('prominence', 0.01)
     distance = nnls_reg_params.get('distance', 1)
@@ -540,6 +598,15 @@ def nnls_reg_simple(df, name, nnls_reg_params):
     #create the vectors
     tau = df['t [s]'].to_numpy()
     D = df['g(2)-1'].to_numpy()
+
+    if weights is None and 'weight' in df.columns:
+        weights = df['weight'].to_numpy()
+    if weights is None:
+        sqrt_w = np.ones_like(tau)
+    else:
+        w = np.asarray(weights, dtype=float)
+        sqrt_w = np.sqrt(w / np.mean(w))
+
     beta_init = float(np.max(D[:min(5, len(D))])) if fit_beta else 1.0
     
     #create grid of tau and decay time combinations
@@ -567,7 +634,7 @@ def nnls_reg_simple(df, name, nnls_reg_params):
             beta_val = 1.0
             f = params_vec
         model_output = beta_val * (T @ f)**2
-        fit_residuals = model_output - D
+        fit_residuals = sqrt_w * (model_output - D)
         smoothness_penalty = alpha * (D2 @ f)
         return np.concatenate([fit_residuals, smoothness_penalty])
 
