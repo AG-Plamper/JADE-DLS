@@ -1,5 +1,53 @@
 # CHANGELOG
 
+## v3.0.0
+
+alongside the new weighting feature, intensity.py is retired and merged into preprocessing.py
+
+### New Files
+
+- **weighting.py** - Heteroscedastic noise weighting for DLS correlation-function fits, based on Biganzoli & Ferri (Opt. Express 26, 29375, 2018), a correction to the Schätzel (1990) noise formula for the "triangular averaging" effect of finite per-channel sampling time in multi-tau correlators. Provides estimate_weights() (per-channel weight vector from the coherence factor, correlation time, measuring time and the two ALV channel count rates -- geometric mean per Eq. 16 for cross-correlation setups), compute_weights_for_all(processed_correlations, df_basedata_mod) (loops estimate_weights() over a full correlation dict, reading Duration/MeanCR0/MeanCR1 directly off df_basedata_mod -- no separate file_to_path argument needed, since preprocessing.extract_data() now provides all three) and apply_weights_to_correlations() (returns a new correlation dict with a 'weight' column added to each DataFrame). Weighting is opt-in and off by default. Per-file "channel(s) outside the validated range" notes are aggregated into a single plain-language summary per batch rather than printed once per file.
+
+---
+
+### Removed Files
+
+- **intensity.py** - retired; merged into preprocessing.py. extract_intensity() is gone -- preprocessing.extract_data() now extracts MeanCR0, MeanCR1 and Monitor Diode in the same file pass as angle/temperature/wavelength/refractive_index/viscosity/duration (one file read instead of two per measurement). plot_meancr() moved to preprocessing.py unchanged. Update any `from intensity import ...` to `from preprocessing import ...`.
+
+---
+
+### preprocessing.py
+
+- extract_data(): now also extracts Duration [s], MeanCR0, MeanCR1 and Monitor Diode from the ALV header, alongside angle/temperature/wavelength/refractive_index/viscosity, all in the same pass over the file (see intensity.py above).
+- Added plot_meancr() (moved unchanged from intensity.py): scatter plot of corrected mean intensity vs angle.
+
+---
+
+### regularized.py
+
+- nnls(), nnls_reg(), nnls_reg_simple(): added optional weights parameter. When omitted, a 'weight' column on the input DataFrame is auto-detected and used instead; when neither is present, behaviour is byte-identical to before (verified against stored reference outputs). Weighting scales the data-fidelity residual by sqrt(weights); the Tikhonov smoothness/sparsity penalty terms (nnls_reg only) are left unweighted. nnls()/nnls_reg() results now also include weighted_R_squared and weighted fields.
+- nnls_all(), nnls_reg_all(), analyze_random_datasets_grid(): no signature changes -- weighting is controlled entirely by which correlation dict is passed in (see weighting.py's apply_weights_to_correlations()), so the plain-NNLS pass and the alpha grid-search both pick up weighting automatically.
+
+---
+
+### cumulants.py
+
+- plot_processed_correlations() (Method B): added weighted least-squares support via the same auto-detected 'weight' column, with weights propagated from g(2)-1 space into ln(sqrt(g2-1)) space via the delta method. Falls back to the existing linregress-based fit, unchanged, when unweighted.
+
+---
+
+### cumulants_C.py
+
+- plot_processed_correlations_iterative() (Method C): added weighted fitting support via curve_fit's sigma parameter, applied in both adaptive (zoom-grid) and expert modes; the zoom-grid's best-fit selection uses the weighted R² when weighted. Falls back to the existing fit, unchanged, when unweighted.
+
+---
+
+### cumulants_D.py
+
+- fit_cumulant_D(): added optional weights parameter, passed to curve_fit as sigma; unchanged when omitted.
+- fit_correlations_method_D(): auto-detects a 'weight' column and passes it through to fit_cumulant_D(); model-order (n_modes) selection uses the weighted residual sum of squares when weighted.
+
+
 ## v2.3.0
 reworked sls_functions_for_regularized.py
 ### sls_functions_for_regularized.py
