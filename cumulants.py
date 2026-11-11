@@ -9,7 +9,8 @@ Functions
 ---------
 extract_cumulants(file_path, encodings)
     Extract 1st, 2nd and 3rd order cumulant frequencies and expansion
-    parameters from ALV .ASC files with robust encoding fallback.
+    parameters (mu2 of the 2nd-order block, mu2 and mu3 of the 3rd-order
+    block) from ALV .ASC files with robust encoding fallback.
 
 calculate_g2_B(dataframes_dict)
     Prepare correlation data for Method B by computing ln√(g²−1),
@@ -18,6 +19,8 @@ calculate_g2_B(dataframes_dict)
 analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, ...)
     Linear regression of Γ vs q² (OLS via statsmodels) to extract the
     translational diffusion coefficient D and associated statistics.
+    With fit_through_origin=True the reported R² is the uncentered R²
+    (1 - SS_res / ΣΓ²), not comparable with the free-intercept R².
 
 remove_rows_by_index(df, indices_str)
     Interactive removal of bad-fit rows from a DataFrame by index.
@@ -39,6 +42,7 @@ from scipy.stats import linregress
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 import statsmodels.api as sm
+from weighting import fit_r_squared
 
 
 #takes cumulant data from ALV-datafile and ensures robust encoding handling
@@ -148,12 +152,29 @@ def extract_cumulants(file_path, encodings=['Windows-1252', 'utf-8', 'latin1', '
 
                 if not found_cumulant:
                     print(f"3rd order cumulant not found in {file_path}")
-                    
+
+                #extract cumulant 3rd order expansion parameter mu3 (line after mu2)
+                cumulant_3rd_order_exp_param3 = None
+                for i, line in enumerate(lines):
+                    if "Cumulant 3.Order" in line:
+                        try:
+                            next_line = lines[i + 5]
+                            if "Expansion Parameter" in next_line:
+                                match = re.search(r"[-+]?\d*\.\d+(?:[eE][-+]?\d+)?", next_line)
+                                if match:
+                                    cumulant_3rd_order_exp_param3 = float(match.group(0))
+                            if cumulant_3rd_order_exp_param3 is None:
+                                print(f"3rd order expansion parameter mu3 not found in {file_path}")
+                        except IndexError:
+                            print(f"Error extracting 3rd order expansion parameter mu3 from {file_path}")
+                        break
+
                 data = {'1st order frequency [1/ms]': [cumulant_1st_order], 
                         '2nd order frequency [1/ms]': [cumulant_2nd_order], 
                         '3rd order frequency [1/ms]': [cumulant_3rd_order],
                         '2nd order frequency exp param [ms^2]': [cumulant_2nd_order_exp_param],
-                        '3rd order frequency exp param [ms^2]': [cumulant_3rd_order_exp_param]}
+                        '3rd order frequency exp param [ms^2]': [cumulant_3rd_order_exp_param],
+                        '3rd order frequency exp param3 [ms^3]': [cumulant_3rd_order_exp_param3]}
                 return pd.DataFrame(data)
 
         except UnicodeDecodeError:
@@ -284,7 +305,9 @@ def analyze_diffusion_coefficient(data_df, q_squared_col, gamma_cols, method_nam
             residuals = Y_arr - slope * X_arr
             sigma2   = np.sum(residuals**2) / max(len(X_arr) - 1, 1)
             slope_se = float(np.sqrt(sigma2 / np.dot(X_arr, X_arr)))
-            ss_tot   = float(np.sum((Y_arr - Y_arr.mean())**2))
+            #uncentered R² (no intercept in the model), as statsmodels OLS without a constant;
+            #not directly comparable with the centered R² of the free-intercept fit
+            ss_tot   = float(np.sum(Y_arr**2))
             r_squared = 1.0 - float(np.sum(residuals**2)) / ss_tot if ss_tot > 0 else float('nan')
             intercept    = 0.0
             intercept_se = 0.0
@@ -468,10 +491,9 @@ def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=N
                 denom = Sw * Swxx - Swx ** 2
                 slope = (Sw * Swxy - Swx * Swy) / denom
                 intercept = (Swxx * Swy - Swx * Swxy) / denom
-                se = np.nan  # weighted slope std-error not derived here
-
-                y_wmean = np.average(y_fit, weights=w_fit)
-                weighted_ss_tot = np.sum(w_fit * (y_fit - y_wmean) ** 2)
+                #std error of the weighted slope (relative weights; equals linregress for w = 1)
+                s2 = np.sum(w_fit * (y_fit - slope * x_fit - intercept) ** 2) / (len(x_fit) - 2)
+                se = float(np.sqrt(s2 * Sw / denom))
             else:
                 slope, intercept, r, p, se = linregress(x_fit, y_fit)
 
@@ -490,13 +512,7 @@ def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=N
 
             # residuals
             residuals = y_fit - (slope * x_fit + intercept)
-            if is_weighted:
-                weighted_ss_res = np.sum(w_fit * residuals ** 2)
-                r_squared = 1 - weighted_ss_res / weighted_ss_tot if weighted_ss_tot != 0 else np.nan
-            else:
-                ss_res = np.sum(residuals**2)
-                ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
-                r_squared = 1 - (ss_res / ss_tot)
+            r_squared = fit_r_squared(y_fit, slope * x_fit + intercept, w_fit if is_weighted else None)
             fit_result['R_squared'] = r_squared
 
             #3-panel layout: data+fit | residuals | Q-Q
@@ -521,17 +537,24 @@ def plot_processed_correlations(dataframes_dict, fit_x_limits, xlim=None, ylim=N
                      transform=ax1.transAxes, va='top', ha='right',
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
+            #panels 2 and 3 show what the fit minimised: r·√w with the fit's weights when weighted
+            plot_resid = (np.asarray(residuals) * np.sqrt(w_fit) if is_weighted
+                          else np.asarray(residuals))
+            resid_label = 'weighted residuals' if is_weighted else 'residuals'
+
             #panel 2: residuals
-            ax2.plot(residuals)
+            ax2.plot(plot_resid)
             ax2.axhline(0, color='r', linestyle='--', linewidth=1)
-            ax2.set_xlabel('Sample Index')
-            ax2.set_ylabel('Residuals')
-            ax2.set_title('Residuals')
+            ax2.set_xlabel('lag-time index')
+            ax2.set_ylabel(resid_label)
+            ax2.set_title(f'Residuals{w_label}')
             ax2.grid(True, alpha=0.3)
 
             #panel 3: Q-Q
-            stats.probplot(residuals, dist="norm", plot=ax3)
-            ax3.set_title('Q-Q Plot')
+            stats.probplot(plot_resid, dist="norm", plot=ax3)
+            ax3.set_xlabel('theoretical quantiles')
+            ax3.set_ylabel('sample quantiles')
+            ax3.set_title(f'Q-Q Plot{w_label}')
             ax3.grid(True, alpha=0.3)
 
             plt.tight_layout()

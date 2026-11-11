@@ -44,6 +44,7 @@ import inspect
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
+from weighting import fit_r_squared
 
 #physical parameter bounds used when method='trf' or 'dogbox'
 #c = μ₂ (variance) and e = μ₄ (4th moment) are mathematically non-negative;
@@ -212,20 +213,8 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
 
             #helpers scoped to this dataset
             def _metrics(popt):
-                yc     = fit_function2(x_fit, *popt)
-                res    = y_fit - yc
-                if is_weighted:
-                    w_arr  = sigma_fit ** -2
-                    ss_res = np.sum(w_arr * res**2)
-                    y_wmean = np.average(y_fit, weights=w_arr)
-                    ss_tot = np.sum(w_arr * (y_fit - y_wmean)**2)
-                else:
-                    ss_res = np.sum(res**2)
-                    ss_tot = np.sum((y_fit - np.mean(y_fit))**2)
-                r2     = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-                n      = len(y_fit)
-                k      = len(popt) + 1
-                return r2, float(np.sqrt(np.sum(res**2) / n)), float(n * np.log(np.sum(res**2) / n) + 2 * k)
+                return fit_r_squared(y_fit, fit_function2(x_fit, *popt),
+                                     sigma_fit ** -2 if is_weighted else None)
 
             def _do_fit(p0, maxfev_override=None):
                 mfev = maxfev_override if maxfev_override is not None else maxfev
@@ -274,7 +263,7 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
                             elif pn == 'f': p0.append(f_base)
                         try:
                             popt_i, pcov_i = _do_fit(p0, rnd['maxfev'])
-                            r2_i, _, _     = _metrics(popt_i)
+                            r2_i           = _metrics(popt_i)
                             all_y_fits.append((popt_i, fit_function2(x_data, *popt_i)))
                             all_r_squared.append(r2_i)
                             if r2_i > rnd_best_r2:
@@ -334,11 +323,9 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
                     all_y_fits.append((popt, fit_function2(x_data, *popt)))
                     current_guess = popt
 
-                    r2, rmse, aic = _metrics(popt)
+                    r2 = _metrics(popt)
                     all_r_squared.append(r2)
                     fit_result[f'R-squared_iter{i+1}'] = r2
-                    fit_result[f'RMSE_iter{i+1}']      = rmse
-                    fit_result[f'AIC_iter{i+1}']       = aic
                     for j, pn in enumerate(param_names):
                         fit_result[f'{pn}_iter{i+1}'] = popt[j]
 
@@ -358,13 +345,8 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
 
             yc_best        = fit_function2(x_fit, *best_popt)
             best_residuals = y_fit - yc_best
-            ss_res_best    = np.sum(best_residuals**2)
-            n              = len(y_fit)
-            k              = len(best_popt) + 1
 
             fit_result['best_R-squared'] = best_r2_val
-            fit_result['best_RMSE']      = float(np.sqrt(ss_res_best / n))
-            fit_result['best_AIC']       = float(n * np.log(ss_res_best / n) + 2 * k)
 
             for j, pn in enumerate(param_names):
                 pv = best_popt[j]
@@ -410,15 +392,22 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
                      transform=ax1.transAxes, va='top', ha='right',
                      bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
-            ax2.plot(best_residuals)
+            #panels 2 and 3 show what the fit minimised: r/σ = r·√w̃ when weighted
+            plot_resid = (np.asarray(best_residuals) / sigma_fit if is_weighted
+                          else np.asarray(best_residuals))
+            resid_label = 'weighted residuals' if is_weighted else 'residuals'
+
+            ax2.plot(plot_resid)
             ax2.axhline(0, color='r', linestyle='--', linewidth=1)
-            ax2.set_xlabel('Sample Index')
-            ax2.set_ylabel('Residuals')
-            ax2.set_title('Residuals')
+            ax2.set_xlabel('lag-time index')
+            ax2.set_ylabel(resid_label)
+            ax2.set_title(f'Residuals{w_label}')
             ax2.grid(True, alpha=0.3)
 
-            stats.probplot(best_residuals, dist="norm", plot=ax3)
-            ax3.set_title('Q-Q Plot')
+            stats.probplot(plot_resid, dist="norm", plot=ax3)
+            ax3.set_xlabel('theoretical quantiles')
+            ax3.set_ylabel('sample quantiles')
+            ax3.set_title(f'Q-Q Plot{w_label}')
             ax3.grid(True, alpha=0.3)
 
             plt.tight_layout()
@@ -428,7 +417,7 @@ def plot_processed_correlations_iterative(dataframes_dict, fit_function2, fit_x_
         except RuntimeError as e:
             print(f"[WARNING] '{name}': fit failed — {e}. Filling with NaN.")
             fit_result['Error'] = str(e)
-            for col in ['best_R-squared', 'best_RMSE', 'best_AIC']:
+            for col in ['best_R-squared']:
                 fit_result.setdefault(col, np.nan)
             for pn in param_names:
                 fit_result.setdefault('best_' + pn, np.nan)

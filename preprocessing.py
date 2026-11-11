@@ -568,6 +568,12 @@ def process_correlation_data(input_dict, columns_to_remove = None):
 
     return output_dict
 
+#scattered intensity per file: mean of both detector count rates, normalised to the
+#monitor diode (laser power) and multiplied by sin θ (scattering volume) [kHz]
+def corrected_intensity(df):
+    return ((df['meancr0 [kHz]'] + df['meancr1 [kHz]']) / 2
+            / (df['monitordiode [cps]'] * 1e-3) * np.sin(np.radians(df['angle [°]'])))
+
 #plot mean intensities vs angle (formerly intensity.py's plot_meancr, moved
 #here since MeanCR0/MeanCR1 are now extracted by extract_data() above)
 def plot_meancr(df, x_col, y_col, title='', figsize=(8, 4), save_path=None):

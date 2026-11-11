@@ -16,8 +16,8 @@ dirac_sum_g2(t, beta, *gammas)
     Intensity correlation function g²(τ) = 1 + β·|g¹(τ)|² for N modes.
 
 fit_cumulant_D(x_data, y_data, n_max, beta_initial, gamma_initial, n_start, weights=None)
-    Iterative fitting from n_start to n_max exponential modes; selects
-    optimal model order by AIC with convergence and residual checks.
+    Iterative fitting from n_start to n_max exponential modes; stops by
+    convergence checks and keeps the fit with the lowest residual sum.
     weights=None (default) reproduces the exact original unweighted fit.
 
 calculate_moments_from_gammas(gammas)
@@ -41,6 +41,7 @@ from scipy.optimize import curve_fit
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
+from weighting import fit_r_squared
 
 try:
     import statsmodels.api as sm
@@ -99,11 +100,10 @@ def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=Non
     fit results as initial guesses for speed. Chooses the solution that minimizes
     residual sum of squares while ensuring monotonicity constraints (Γᵢ > Γᵢ₋₁ > 0).
     """
-    if weights is not None:
-        w = np.asarray(weights, dtype=float)
-        sigma = 1.0 / np.sqrt(w / np.mean(w))
-    else:
-        sigma = None
+    #relative weights (mean 1); ones when unweighted, so fit_ss below is the plain RSS
+    w_rel = (np.ones_like(np.asarray(y_data, dtype=float)) if weights is None
+             else np.asarray(weights, dtype=float) / np.mean(weights))
+    sigma = None if weights is None else 1.0 / np.sqrt(w_rel)
 
     #estimate initial gamma from data if not provided
     if gamma_initial is None:
@@ -190,12 +190,10 @@ def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=Non
             g1_fit = dirac_sum_g1(x_data, *gammas_fit)
             g2_fit = beta_fit * g1_fit**2
 
-            #calculate residuals -- residual_ss (unweighted) drives the convergence
-            #checks below unchanged; when weighted, model-order selection (best_result)
-            #uses the weighted sum instead, matching what the fit actually optimized
+            #residuals: unweighted residual_ss and the sum the fit minimised (fit_ss)
             residuals = y_data - g2_fit
             residual_ss = np.sum(residuals**2)
-            selection_ss = np.sum((residuals / sigma) ** 2) if sigma is not None else residual_ss
+            fit_ss = np.sum(w_rel * residuals**2)
 
             #store result
             result = {
@@ -203,16 +201,16 @@ def fit_cumulant_D(x_data, y_data, n_max=25, beta_initial=1.0, gamma_initial=Non
                 'beta': beta_fit,
                 'gammas': gammas_fit,
                 'residual_ss': residual_ss,
+                'fit_ss': fit_ss,
                 'g1_fit': g1_fit,
                 'g2_fit': g2_fit,
                 'convergence': 'success'
             }
             all_results.append(result)
 
-            #update best result if this is better (compared on the same scale
-            #the fit actually optimized -- weighted when weights are given)
-            if selection_ss < best_residual:
-                best_residual = selection_ss
+            #update best result if this is better
+            if fit_ss < best_residual:
+                best_residual = fit_ss
                 best_result = result
             
             # === CONVERGENCE CHECKS ===
@@ -271,15 +269,15 @@ def calculate_moments_from_gammas(gammas):
     #calculate polydispersity index
     pdi = gamma_2 / gamma_mean**2 - 1 if gamma_mean != 0 else float('nan')
     
-    #calculate skewness
+    #skewness μ₃/μ₂^1.5 and kurtosis μ₄/μ₂² (Gaussian = 3, as Method C);
+    #undefined (NaN) for zero width, e.g. a single mode
     numerator = gamma_3 - 3*gamma_2*gamma_mean + 2*gamma_mean**3
     denominator = (gamma_2 - gamma_mean**2)**(3/2)
-    skewness = numerator / denominator if denominator != 0 else 0
-    
-    #calculate excess kurtosis
+    skewness = numerator / denominator if denominator != 0 else float('nan')
+
     numerator_k = gamma_4 - 4*gamma_3*gamma_mean + 6*gamma_2*gamma_mean**2 - 3*gamma_mean**4
     denominator_k = (gamma_2 - gamma_mean**2)**2
-    kurtosis = numerator_k / denominator_k - 3 if denominator_k != 0 else 0
+    kurtosis = numerator_k / denominator_k if denominator_k != 0 else float('nan')
 
     moments = {
         'gamma_mean': gamma_mean,
@@ -298,6 +296,8 @@ def cluster_gammas(gammas, gap_threshold=1.5):
     """
     Groups gammas into distinct populations by detecting large gaps.
     Each cluster represents one population in a multimodal sample.
+    Adjacent sorted decay rates whose ratio Gamma(i+1)/Gamma(i) exceeds
+    gap_threshold (linear ratio, not log10) start a new population.
     
     Examples:
     ---------
@@ -396,16 +396,16 @@ def fit_correlations_method_D(dataframes_dict, x_col='t [s]', y_col='g(2)-1',
             fit_result['moment_4'] = moments['gamma_4'] #4th moment
             fit_result['kurtosis'] = moments['kurtosis']
             
-            # Calculate R-squared
-            ss_res = result['residual_ss']
-            ss_tot = np.sum((y_data - np.mean(y_data))**2)
-            r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+            # R² (weighted when weighted) on the same relative weights as the fit
+            w_rel = weights / np.mean(weights) if is_weighted else np.ones_like(y_data, dtype=float)
+            r_squared = fit_r_squared(y_data, result['g2_fit'], w_rel)
             fit_result['R-squared'] = r_squared
-            
+
             # Plot if requested
             if plot:
-                # Calculate residuals
-                residuals = y_data - result['g2_fit']
+                # residual panels show what the fit minimised: r·√w_rel
+                plot_resid = (y_data - result['g2_fit']) * np.sqrt(w_rel)
+                resid_label = 'weighted residuals' if is_weighted else 'residuals'
 
                 # 3-panel layout: data+fit | residuals | Q-Q
                 fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
@@ -432,16 +432,18 @@ def fit_correlations_method_D(dataframes_dict, x_col='t [s]', y_col='g(2)-1',
                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
                 # Panel 2: residuals
-                ax2.plot(residuals)
+                ax2.plot(plot_resid)
                 ax2.axhline(0, color='r', linestyle='--', linewidth=1)
-                ax2.set_xlabel('Sample Index')
-                ax2.set_ylabel('Residuals')
-                ax2.set_title('Residuals')
+                ax2.set_xlabel('lag-time index')
+                ax2.set_ylabel(resid_label)
+                ax2.set_title(f'Residuals{w_label}')
                 ax2.grid(True, alpha=0.3)
 
                 # Panel 3: Q-Q
-                stats.probplot(residuals, dist="norm", plot=ax3)
-                ax3.set_title('Q-Q Plot')
+                stats.probplot(plot_resid, dist="norm", plot=ax3)
+                ax3.set_xlabel('theoretical quantiles')
+                ax3.set_ylabel('sample quantiles')
+                ax3.set_title(f'Q-Q Plot{w_label}')
                 ax3.grid(True, alpha=0.3)
 
                 plt.tight_layout()

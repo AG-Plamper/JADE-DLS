@@ -28,7 +28,9 @@ _simple_threshold_clustering(gammas_df, distance_threshold) [internal]
     Threshold-based clustering in log Γ space.
 
 _refine_clusters_with_silhouette(gammas_df, threshold, ...) [internal]
-    Iteratively merge clusters to maximise silhouette score.
+    Single pass: points with a silhouette score below threshold are
+    reassigned to the cluster with the nearest mean log value. Clusters
+    are not merged and the number of clusters does not change.
 
 _calculate_silhouette_scores(gammas_df, cluster_labels)     [internal]
     Compute per-cluster and mean silhouette scores.
@@ -56,12 +58,22 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
                        distance_threshold=0.3, min_abundance=0.3,
                        clustering_strategy='simple', silhouette_threshold=0.3,
                        uncertainty_flags=False, uncertainty_threshold=0.5,
+                       zscore_threshold=None, silhouette_uncertainty_threshold=None,
                        plot=True, experiment_name=''):
     """
     Can operate in two modes:
     1. Clustering enabled: Groups gammas across files by similarity
     2. Clustering disabled: Pass-through mode (returns data unchanged)
+
+    With uncertainty_flags=True, points are flagged as uncertain if their
+    silhouette score is below silhouette_uncertainty_threshold (several
+    populations) or their |z| of log D (or log Γ) exceeds zscore_threshold
+    (one population). Both fall back to uncertainty_threshold when None.
     """
+    if zscore_threshold is None:
+        zscore_threshold = uncertainty_threshold
+    if silhouette_uncertainty_threshold is None:
+        silhouette_uncertainty_threshold = uncertainty_threshold
     
     #PASS-THROUGH MODE
     if not enable_clustering:
@@ -100,7 +112,8 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
     print(f"Method: {method}")
     print(f"Strategy: {clustering_strategy}")
     if uncertainty_flags:
-        print(f"Uncertainty flags: enabled (threshold={uncertainty_threshold})")
+        print(f"Uncertainty flags: enabled (silhouette < {silhouette_uncertainty_threshold}, "
+              f"one population: |z| > {zscore_threshold})")
     print(f"Input: {len(data_df)} files, {len(gamma_cols)} gamma columns")
     
     # Step 1: Collect all gammas with their metadata
@@ -170,45 +183,14 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
     print(f"\n→ Found {n_populations} population(s)")
     
     # Step 3: Calculate population statistics and identify outlier populations
-    population_stats = []
-    for cluster_id in sorted(np.unique(cluster_labels)):
-        cluster_gammas = gammas_df[gammas_df['cluster'] == cluster_id]['gamma']
-        cluster_files  = gammas_df[gammas_df['cluster'] == cluster_id]['filename'].unique()
-
-        abundance  = len(cluster_files) / len(data_df)
-        mean_gamma = np.exp(np.mean(np.log(cluster_gammas)))
-        std_gamma  = np.std(cluster_gammas)
-        is_reliable = abundance >= min_abundance
-        status = "RELIABLE" if is_reliable else "OUTLIER (below min_abundance)"
-
-        stats_dict = {
-            'cluster_id' : cluster_id,
-            'n_gammas'   : len(cluster_gammas),
-            'n_files'    : len(cluster_files),
-            'abundance'  : abundance,
-            'mean_gamma' : mean_gamma,
-            'std_gamma'  : std_gamma,
-            'reliable'   : is_reliable,
-            'status'     : status
-        }
-
+    stats_df = _population_stats(gammas_df, len(data_df), min_abundance, normalize_by_q2)
+    for _, s in stats_df.iterrows():
+        print(f"\nPopulation {s['cluster_id'] + 1}:")
+        print(f"  Mean Γ: {s['mean_gamma']:.1f} s⁻¹ (±{s['std_gamma']:.1f})")
         if normalize_by_q2:
-            cluster_D = gammas_df[gammas_df['cluster'] == cluster_id]['D']
-            mean_D = np.exp(np.mean(np.log(cluster_D)))
-            std_D  = np.std(cluster_D)
-            stats_dict['mean_D'] = mean_D
-            stats_dict['std_D']  = std_D
-
-        population_stats.append(stats_dict)
-
-        print(f"\nPopulation {cluster_id + 1}:")
-        print(f"  Mean Γ: {mean_gamma:.1f} s⁻¹ (±{std_gamma:.1f})")
-        if normalize_by_q2:
-            print(f"  Mean D: {mean_D:.2e} nm²/s (±{std_D:.2e})")
-        print(f"  Abundance: {len(cluster_files)}/{len(data_df)} files ({abundance*100:.1f}%)")
-        print(f"  Status: {status}")
-
-    stats_df = pd.DataFrame(population_stats)
+            print(f"  Mean D: {s['mean_D']:.2e} nm²/s (±{s['std_D']:.2e})")
+        print(f"  Abundance: {s['n_files']}/{len(data_df)} files ({s['abundance']*100:.1f}%)")
+        print(f"  Status: {s['status']}")
 
     #flag points belonging to outlier populations
     outlier_cluster_ids = set(stats_df[~stats_df['reliable']]['cluster_id'].tolist())
@@ -226,10 +208,7 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
     if n_reliable_populations == 0:
         print("WARNING: No reliable populations found. "
               "Consider lowering min_abundance or distance_threshold.")
-        stats_df_reliable = pd.DataFrame()
-    else:
-        stats_df_reliable = stats_df[stats_df['reliable']].reset_index(drop=True)
-    
+
     # Step 3.5: Silhouette / z-score analysis on reliable populations only
     silhouette_scores = None
     need_silhouette = (clustering_strategy == 'silhouette_refined' or uncertainty_flags)
@@ -249,10 +228,10 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
                     z_scores = np.zeros(len(vals))
                 gammas_df_reliable = gammas_df_reliable.copy()
                 gammas_df_reliable['z_score']  = z_scores
-                gammas_df_reliable['uncertain'] = z_scores > uncertainty_threshold
+                gammas_df_reliable['uncertain'] = z_scores > zscore_threshold
                 val_label = "log(D)" if normalize_by_q2 else "log(Γ)"
                 print(f"Mean {val_label}: {mean_val:.3f}  Std: {std_val:.3f}")
-                print(f"Flagging points with |z| > {uncertainty_threshold} as uncertain")
+                print(f"Flagging points with |z| > {zscore_threshold} as uncertain")
                 n_uncertain = gammas_df_reliable['uncertain'].sum()
                 print(f"→ {n_uncertain}/{len(gammas_df_reliable)} uncertain point(s) in single population")
                 if n_uncertain > 0:
@@ -297,7 +276,7 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
             if uncertainty_flags:
                 print("UNCERTAINTY FLAGGING")
                 gammas_df_reliable['uncertain'] = (
-                    gammas_df_reliable['silhouette'] < uncertainty_threshold
+                    gammas_df_reliable['silhouette'] < silhouette_uncertainty_threshold
                 )
                 n_uncertain = gammas_df_reliable['uncertain'].sum()
                 pct_uncertain = n_uncertain / len(gammas_df_reliable) * 100
@@ -342,33 +321,15 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
                         )
                     gammas_df_clean['cluster'] = new_labels
 
-                    # Recalculate stats
-                    population_stats_clean = []
-                    for cluster_id in sorted(gammas_df_clean['cluster'].unique()):
-                        cg = gammas_df_clean[gammas_df_clean['cluster'] == cluster_id]['gamma']
-                        cf = gammas_df_clean[gammas_df_clean['cluster'] == cluster_id]['filename'].unique()
-                        ab = len(cf) / len(data_df)
-                        mg = np.exp(np.mean(np.log(cg)))
-                        sd = np.std(cg)
-                        sd_clean = {
-                            'cluster_id': cluster_id, 'n_gammas': len(cg),
-                            'n_files': len(cf), 'abundance': ab,
-                            'mean_gamma': mg, 'std_gamma': sd,
-                            'reliable': ab >= min_abundance,
-                            'status': "RELIABLE" if ab >= min_abundance else "OUTLIER"
-                        }
-                        if normalize_by_q2:
-                            cd2 = gammas_df_clean[gammas_df_clean['cluster'] == cluster_id]['D']
-                            sd_clean['mean_D'] = np.exp(np.mean(np.log(cd2)))
-                            sd_clean['std_D']  = np.std(cd2)
-                        population_stats_clean.append(sd_clean)
-
-                    gammas_df_reliable = gammas_df_clean
-                    stats_df_reliable  = pd.DataFrame(population_stats_clean)
-                    n_reliable_populations = len(stats_df_reliable)
+                    # keep only clusters that fulfil min_abundance, as in step 3
+                    stats_clean = _population_stats(gammas_df_clean, len(data_df),
+                                                    min_abundance, normalize_by_q2)
                     reliable_cluster_ids = sorted(
-                        stats_df_reliable['cluster_id'].tolist()
-                    )
+                        stats_clean.loc[stats_clean['reliable'], 'cluster_id'].tolist())
+                    dropped = ~gammas_df_clean['cluster'].isin(reliable_cluster_ids)
+                    gammas_df.loc[gammas_df_clean.index[dropped], 'outlier'] = True
+                    gammas_df_reliable = gammas_df_clean[~dropped].copy()
+                    n_reliable_populations = len(reliable_cluster_ids)
 
                     #recalculate silhouette
                     sc = _calculate_silhouette_scores(
@@ -382,15 +343,35 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
                     print("\n→ Keeping all data (uncertain points flagged but not removed)")
     
     # Step 4: Reassign reliable gammas to population columns
-    # Remap reliable cluster_ids to sequential 1, 2, 3, ... population numbers
+    # Remap reliable cluster_ids to sequential 1, 2, 3, ... population numbers,
+    # ordered by ascending Rh, i.e. descending mean log10 D (or log10 Gamma): pop1 = fastest
+    # population (smallest particles). Ward labels themselves carry no order.
+    _mean_log = (gammas_df_reliable.groupby('cluster')['log_clustering_val'].mean()
+                 if len(gammas_df_reliable) else pd.Series(dtype=float))
+    reliable_cluster_ids = sorted(
+        reliable_cluster_ids,
+        key=lambda cid: (np.isnan(_mean_log.get(cid, np.nan)), -_mean_log.get(cid, np.nan), cid))
     cluster_id_to_pop = {cid: i + 1 for i, cid in enumerate(reliable_cluster_ids)}
+
+    # statistics of the final assignment (after refinement / point removal), in population order;
+    # populations that fell below min_abundance are kept but flagged
+    stats_df_reliable = _population_stats(gammas_df_reliable, len(data_df), min_abundance,
+                                          normalize_by_q2, cluster_ids=reliable_cluster_ids)
+    below_min_abundance = [cluster_id_to_pop[c] for c in
+                           stats_df_reliable.loc[~stats_df_reliable['reliable'], 'cluster_id']] \
+                          if not stats_df_reliable.empty else []
+    if below_min_abundance:
+        stats_df_reliable.loc[~stats_df_reliable['reliable'], 'status'] = \
+            'BELOW min_abundance after refinement (kept)'
+        print(f"\nWARNING: population(s) {below_min_abundance} below min_abundance={min_abundance} "
+              f"after refinement (kept, flagged in cluster_info['below_min_abundance'])")
     clustered_df = data_df.copy()
 
     for pop_num in cluster_id_to_pop.values():
         clustered_df[f'gamma_pop{pop_num}'] = np.nan
         if uncertainty_flags:
-            clustered_df[f'uncertain_pop{pop_num}'] = np.nan
-        clustered_df[f'outlier_pop{pop_num}'] = np.nan
+            clustered_df[f'uncertain_pop{pop_num}'] = pd.Series(np.nan, index=clustered_df.index, dtype=object)
+        clustered_df[f'outlier_pop{pop_num}'] = pd.Series(np.nan, index=clustered_df.index, dtype=object)
 
     #fill reliable points
     for _, row in gammas_df_reliable.iterrows():
@@ -485,11 +466,12 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
         'n_outlier_points'        : int(gammas_df['outlier'].sum()),
         'gammas_df'               : gammas_df_reliable,
         'cluster_id_to_pop'       : cluster_id_to_pop,
+        'below_min_abundance'     : below_min_abundance,
     }
-
-    if normalize_by_q2 and not stats_df_reliable.empty and 'mean_D' in stats_df_reliable.columns:
-        cluster_info['population_D_means'] = stats_df_reliable['mean_D'].tolist()
-        cluster_info['population_D_stds']  = stats_df_reliable['std_D'].tolist()
+    #D statistics: always present, NaN per population when clustering on Γ
+    for key, col in (('population_D_means', 'mean_D'), ('population_D_stds', 'std_D')):
+        cluster_info[key] = (stats_df_reliable[col].tolist() if col in stats_df_reliable.columns
+                             else [np.nan] * len(stats_df_reliable))
 
     print("\n" + "="*70)
     print("In SUMMARY:")
@@ -503,12 +485,37 @@ def cluster_all_gammas(data_df, gamma_cols, q_squared_col=None,
 
     return clustered_df, cluster_info
 
+#statistics per cluster: abundance (share of files), geometric mean and std of Γ (and D)
+def _population_stats(gammas_df, n_files, min_abundance, normalize_by_q2, cluster_ids=None):
+    if cluster_ids is None:
+        cluster_ids = sorted(gammas_df['cluster'].unique())
+    rows = []
+    for cid in cluster_ids:
+        g  = gammas_df[gammas_df['cluster'] == cid]
+        ab = g['filename'].nunique() / n_files
+        row = {'cluster_id': cid, 'n_gammas': len(g), 'n_files': g['filename'].nunique(),
+               'abundance': ab,
+               'mean_gamma': np.exp(np.mean(np.log(g['gamma']))) if len(g) else np.nan,
+               'std_gamma': np.std(g['gamma']) if len(g) else np.nan,
+               'reliable': ab >= min_abundance,
+               'status': "RELIABLE" if ab >= min_abundance else "OUTLIER (below min_abundance)"}
+        if normalize_by_q2:
+            row['mean_D'] = np.exp(np.mean(np.log(g['D']))) if len(g) else np.nan
+            row['std_D']  = np.std(g['D']) if len(g) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
 #perform hierarchical clustering on gamma values
 def _hierarchical_clustering(gammas_df, n_clusters='auto', 
                              distance_threshold=0.3, normalize_by_q2=False, plot=True):    
     #prepare data for clustering (use log_clustering_val which is either log(Γ) or log(D))
     X = gammas_df['log_clustering_val'].values.reshape(-1, 1)
-    
+
+    #a single point cannot be linked: one cluster, no dendrogram
+    if len(X) < 2:
+        print("\nOnly one valid point: one cluster")
+        return np.zeros(len(X), dtype=int), None
+
     #perform hierarchical clustering
     linkage_matrix = linkage(X, method='ward')
     
@@ -786,6 +793,15 @@ def _calculate_silhouette_scores(gammas_df, cluster_labels):
 
 #try to reassign points with low silhouette scores to better clusters
 def _refine_clusters_with_silhouette(gammas_df, threshold, normalize_by_q2):
+    """
+    Reassign poorly fitting points in one pass (used by clustering_strategy='silhouette_refined').
+
+    Each point with silhouette < threshold is moved to the cluster whose mean
+    log_clustering_val is nearest; cluster means are taken from the current
+    assignment, so they reflect earlier reassignments within the pass.
+    Clusters are not merged and the number of clusters does not change.
+    Modifies gammas_df['cluster'] in place and returns the number of reassigned points.
+    """
     n_reassigned = 0
     
     #get unique cluster IDs
@@ -869,7 +885,7 @@ def aggregate_peak_stats(cluster_info, data_df, stat_prefixes=('skewness', 'kurt
                 if stat_col in data_df.columns:
                     vals = data_df[stat_col].dropna()
                     pop_means[i + 1] = vals.mean() if len(vals) > 0 else np.nan
-                    pop_stds[i + 1]  = vals.std()  if len(vals) > 1 else np.nan
+                    pop_stds[i + 1]  = np.std(vals)  if len(vals) > 1 else np.nan
             cluster_info[f'population_{prefix}_mean'] = pop_means
             cluster_info[f'population_{prefix}_std']  = pop_stds
 

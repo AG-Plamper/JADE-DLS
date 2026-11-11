@@ -24,7 +24,7 @@ calculate_decay_rates(df, tau_columns)
 nnls_reg(df, name, nnls_reg_params, plot_number, weights=None)
     Tikhonov-regularized NNLS fit with automatic or fixed regularization
     parameter α; detects peaks, computes area fractions, centroids, FWHM,
-    skewness and excess kurtosis per peak; 4-panel diagnostic plot.
+    skewness and kurtosis (μ₄/σ⁴, Gaussian = 3) per peak; 4-panel diagnostic plot.
     weights=None (default) reproduces the plain unweighted fit exactly;
     otherwise (or via an auto-detected 'weight' column on df -- see
     weighting.py) the data-fidelity residual is scaled by sqrt(weights)
@@ -62,6 +62,9 @@ import pandas as pd
 from scipy import sparse
 from scipy import stats
 from matplotlib import cm
+from weighting import fit_r_squared
+
+_trapezoid = getattr(np, 'trapezoid', None) or np.trapz   # NumPy >= 2.0 / 1.x
 import random
 
 #code for simple NNLS-Fit to the data
@@ -121,13 +124,8 @@ def nnls(df, name, nnls_params, plot_number, weights=None):
     #normalization to the total sum
     normalized_amplitudes_sum = peak_amplitudes / np.sum(peak_amplitudes)
 
-    #R²
-    ss_res = np.sum(residuals_values**2)
-    ss_tot = np.sum((D - np.mean(D))**2)
-    r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-    weighted_ss_res = np.sum((sqrt_w * residuals_values)**2)
-    weighted_ss_tot = np.sum((sqrt_w * (D - np.mean(D)))**2)
-    weighted_r_squared = 1 - (weighted_ss_res / weighted_ss_tot) if weighted_ss_tot != 0 else 0
+    #R² (weighted when weighted; sqrt_w = 1 otherwise)
+    r_squared = fit_r_squared(D, optimized_values, sqrt_w**2)
 
     #4-panel layout: data+fit | distribution | residuals | Q-Q -- identical
     #layout whether weighted or not (see nnls_reg for the same convention)
@@ -156,18 +154,24 @@ def nnls(df, name, nnls_params, plot_number, weights=None):
     ax2.legend()
     ax2.grid(True, which="both", ls="--", alpha=0.3)
 
+    # Panels 3 and 4 show what the fit minimised: sqrt_w·r when weighted (sqrt_w = 1 otherwise)
+    plot_resid = sqrt_w * residuals_values
+    resid_label = 'weighted residuals' if is_weighted else 'residuals'
+
     # Panel 3: residuals
-    ax3.plot(residuals_values)
+    ax3.plot(plot_resid)
     ax3.axhline(0, color='r', linestyle='--', linewidth=1)
-    ax3.set_xlabel('Sample Index')
-    ax3.set_ylabel('Residuals')
-    ax3.set_title('Residuals')
+    ax3.set_xlabel('lag-time index')
+    ax3.set_ylabel(resid_label)
+    ax3.set_title(f'Residuals{w_label}')
     ax3.grid(True, alpha=0.3)
 
     # Panel 4: Q-Q
     from scipy import stats as _stats
-    _stats.probplot(residuals_values, dist="norm", plot=ax4)
-    ax4.set_title('Q-Q Plot')
+    _stats.probplot(plot_resid, dist="norm", plot=ax4)
+    ax4.set_xlabel('theoretical quantiles')
+    ax4.set_ylabel('sample quantiles')
+    ax4.set_title(f'Q-Q Plot{w_label}')
     ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -177,7 +181,6 @@ def nnls(df, name, nnls_params, plot_number, weights=None):
     results = {'filename': name}
 
     results['R_squared'] = r_squared
-    results['weighted_R_squared'] = weighted_r_squared
     results['weighted'] = is_weighted
     for i, peak_index in enumerate(peaks):
         percentage = normalized_amplitudes_sum[i] * 100
@@ -392,7 +395,7 @@ def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
             peak_x = decay_times[left_base_idx:right_base_idx+1]
             
             #calculate peak area using trapezoidal rule
-            peak_area = np.trapz(peak_segment, np.log(peak_x))
+            peak_area = _trapezoid(peak_segment, np.log(peak_x))
             
             #calculate peak width at half maximum (FWHM)
             half_max = peak_amplitudes[i] / 2
@@ -417,14 +420,15 @@ def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
             weighted_mean = np.exp(ln_mean)                           # geometric mean in τ-space
             variance      = np.sum(w * (ln_x - ln_mean)**2)           # variance in log-τ space
             std_dev       = np.sqrt(variance) if variance > 0 else 0  # std dev in log-τ space
+            #kurtosis μ₄/σ⁴ (Gaussian = 3, as Method C); NaN if undefined (zero width or too few points)
             if std_dev > 0 and len(peak_segment) >= 3:
                 peak_skewness = np.sum(w * (ln_x - ln_mean)**3) / std_dev**3
             else:
-                peak_skewness = 0
+                peak_skewness = np.nan
             if std_dev > 0 and len(peak_segment) >= 4:
-                peak_kurtosis = np.sum(w * (ln_x - ln_mean)**4) / std_dev**4 - 3
+                peak_kurtosis = np.sum(w * (ln_x - ln_mean)**4) / std_dev**4
             else:
-                peak_kurtosis = 0
+                peak_kurtosis = np.nan
 
             peak_stats[f'peak_{i+1}'] = {
                 'position'  : decay_times[peak_idx],
@@ -434,11 +438,28 @@ def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
                 'centroid'  : weighted_mean,
                 'std_dev'   : std_dev,
                 'skewness'  : peak_skewness,   # τ-space: positive = tail toward larger particles
-                'kurtosis'  : peak_kurtosis,   # excess kurtosis: >0 = sharp, <0 = broad
+                'kurtosis'  : peak_kurtosis,   # >3 = sharp with heavy tails, <3 = broad
                 'left_idx'  : left_base_idx,
                 'right_idx' : right_base_idx
             }
-    
+
+        #neighbouring maxima whose segments each contain the other maximum are not separated
+        #(the valley never drops below the base threshold): keep the highest one, so the
+        #shared area is counted once
+        st = lambda i: peak_stats[f'peak_{i+1}']
+        groups = []
+        for i in range(len(peaks)):
+            j = groups[-1][-1] if groups else None
+            if (j is not None and st(j)['left_idx'] <= peaks[i] <= st(j)['right_idx']
+                    and st(i)['left_idx'] <= peaks[j] <= st(i)['right_idx']):
+                groups[-1].append(i)
+            else:
+                groups.append([i])
+        keep = [max(g, key=lambda i: st(i)['amplitude']) for g in groups]
+        if len(keep) < len(peaks):
+            peaks, peak_amplitudes = peaks[keep], peak_amplitudes[keep]
+            peak_stats = {f'peak_{k+1}': peak_stats[f'peak_{i+1}'] for k, i in enumerate(keep)}
+
     #area-based normalization over detected peaks only
     if len(peaks) > 0 and peak_stats:
         total_detected_area = np.sum([peak_stats[f'peak_{i+1}']['area'] for i in range(len(peaks))])
@@ -452,20 +473,11 @@ def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
     else:
         normalized_area_percent = []
 
-    #R²
-    ss_res = np.sum(residuals_values**2)
-    ss_tot = np.sum((D - np.mean(D))**2)
-    r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-    #weighted R² (only meaningful when is_weighted; matches the metric the fit
-    #was actually optimizing against)
-    weighted_ss_res = np.sum((sqrt_w * residuals_values)**2)
-    weighted_ss_tot = np.sum((sqrt_w * (D - np.mean(D)))**2)
-    weighted_r_squared = 1 - (weighted_ss_res / weighted_ss_tot) if weighted_ss_tot != 0 else 0
+    #R² (weighted when weighted; sqrt_w = 1 otherwise)
+    r_squared = fit_r_squared(D, optimized_values, sqrt_w**2)
 
     #4-panel layout: data+fit | distribution | residuals | Q-Q -- identical
-    #layout whether weighted or not, only the title tag and the underlying
-    #numbers differ (weighted_R_squared/weighted are still in the returned
-    #results dict for anyone who wants them, just not a separate panel)
+    #layout whether weighted or not, only the title tag and the numbers differ
     fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(24, 6))
     beta_label = f', β={beta_fitted:.3f}' if fit_beta else ''
     w_label = ' [weighted]' if is_weighted else ''
@@ -514,17 +526,23 @@ def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
     ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, which="both", ls="--", alpha=0.3)
 
+    # Panels 3 and 4 show what the fit minimised: sqrt_w·r when weighted (sqrt_w = 1 otherwise)
+    plot_resid = sqrt_w * residuals_values
+    resid_label = 'weighted residuals' if is_weighted else 'residuals'
+
     # Panel 3: residuals
-    ax3.plot(residuals_values)
+    ax3.plot(plot_resid)
     ax3.axhline(0, color='r', linestyle='--', linewidth=1)
-    ax3.set_xlabel('Sample Index')
-    ax3.set_ylabel('Residuals')
-    ax3.set_title('Residuals')
+    ax3.set_xlabel('lag-time index')
+    ax3.set_ylabel(resid_label)
+    ax3.set_title(f'Residuals{w_label}')
     ax3.grid(True, alpha=0.3)
 
     # Panel 4: Q-Q
-    stats.probplot(residuals_values, dist="norm", plot=ax4)
-    ax4.set_title('Q-Q Plot')
+    stats.probplot(plot_resid, dist="norm", plot=ax4)
+    ax4.set_xlabel('theoretical quantiles')
+    ax4.set_ylabel('sample quantiles')
+    ax4.set_title(f'Q-Q Plot{w_label}')
     ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -532,7 +550,7 @@ def nnls_reg(df, name, nnls_reg_params, plot_number, weights=None):
 
     #prepare results for this dataframe
     results = {'filename': name, 'R_squared': r_squared, 'beta': beta_fitted,
-               'weighted_R_squared': weighted_r_squared, 'weighted': is_weighted}
+               'weighted': is_weighted}
     for i, peak_index in enumerate(peaks):
         #tau: maximum or centroid depending on peak_method
         if peak_method == 'centroid' and f'peak_{i+1}' in peak_stats:
@@ -558,7 +576,8 @@ def nnls_reg_all(dataframes_dict, nnls_reg_params):
     all_results = []
     plot_number = 1
     full_results = {}
-    
+    first_error = None
+
     for name, df in dataframes_dict.items():
         print(f"Processing {name}...")
         try:
@@ -579,7 +598,12 @@ def nnls_reg_all(dataframes_dict, nnls_reg_params):
             print(f"Error processing {name}: {str(e)}")
             import traceback
             traceback.print_exc()
-    
+            first_error = first_error or (name, e)
+
+    if not all_results and first_error:
+        raise RuntimeError(f"Regularized fit failed for all {len(dataframes_dict)} datasets; "
+                           f"first error ({first_error[0]}): {first_error[1]}")
+
     #summary DataFrame
     nnls_reg_df = pd.DataFrame(all_results) if all_results else pd.DataFrame()
     

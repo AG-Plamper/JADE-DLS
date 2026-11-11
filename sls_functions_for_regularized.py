@@ -7,9 +7,13 @@ intensity analysis from regularized DLS fits.
 
 Functions
 ---------
+subtract_solvent(df_intensity, solvent_folder)
+    optional: subtracts the mean solvent intensity per angle from every
+    sample run (same monitor-diode and sin θ correction).
+
 compute_sls_data(nnls_reg_data_mod, df_intensity, n_populations)
     area-fraction decomposition:
-    I_pop = I_total * normalized_area_percent_N / 100
+    I_pop = I_total * normalized_area_percent_popN / 100 (population N of the clustering)
 
 compute_guinier_total(sls_data, q2_range)
     Guinier fit on the raw total intensity I_total vs q².
@@ -94,13 +98,53 @@ def _guinier_fit(grouped, grouped_fit, label):
     }
 
 
+#solvent background
+
+def subtract_solvent(df_intensity, solvent_folder, intensity_col='MeanCR_corr [kHz]'):
+    """
+    Optional solvent subtraction: the corrected intensity of the solvent runs in
+    solvent_folder (single runs, '*averaged*' files ignored) is averaged per angle
+    and subtracted from every sample run at the same angle. Returns a new DataFrame;
+    sample and solvent intensities are kept in 'MeanCR_corr_sample [kHz]' and
+    'MeanCR_solvent [kHz]'.
+    """
+    import glob, os
+    from preprocessing import extract_data, corrected_intensity
+    files = [f for f in sorted(glob.glob(os.path.join(solvent_folder, '*.ASC')))
+             if 'averaged' not in os.path.basename(f).lower()]
+    solvent = [d for d in (extract_data(f) for f in files) if d is not None]
+    if not solvent:
+        raise ValueError(f"No solvent files found in {solvent_folder}")
+    solvent = pd.concat(solvent, ignore_index=True)
+    I_solvent = corrected_intensity(solvent).groupby(solvent['angle [°]'].round(2)).mean()
+
+    out = df_intensity.copy()
+    angle = out['angle [°]'].round(2)
+    missing = sorted(set(angle) - set(I_solvent.index))
+    if missing:
+        print(f"WARNING: no solvent measurement at {missing}° — these angles are not corrected.")
+    out['MeanCR_solvent [kHz]'] = angle.map(I_solvent).fillna(0.0)
+    out['MeanCR_corr_sample [kHz]'] = out[intensity_col]
+    out[intensity_col] = out['MeanCR_corr_sample [kHz]'] - out['MeanCR_solvent [kHz]']
+
+    share = 100 * out['MeanCR_solvent [kHz]'] / out['MeanCR_corr_sample [kHz]']
+    print(f"Solvent subtracted ({len(solvent)} runs, {I_solvent.size} angles): "
+          f"{share.min():.2f}–{share.max():.2f} % of the sample intensity")
+    n_bad = int((out[intensity_col] <= 0).sum())
+    if n_bad:
+        print(f"WARNING: {n_bad} run(s) with net intensity <= 0 — angles whose mean is <= 0 "
+              f"are left out of the Guinier fit.")
+    return out
+
+
 #decomposition functions
 
 def compute_sls_data(nnls_reg_data_mod, df_intensity, n_populations):
     """
     Method A — area-fraction decomposition.
 
-    I_pop = I_total * normalized_area_percent_N / 100
+    I_pop = I_total * normalized_area_percent_popN / 100 (population N of the clustering;
+    per-peak columns normalized_area_percent_N only in pass-through mode)
 
     Uses the peak areas from the regularized tau-distribution directly.
     Simple but sensitive to fit-to-fit variation in how peaks are split.
@@ -113,7 +157,10 @@ def compute_sls_data(nnls_reg_data_mod, df_intensity, n_populations):
         df_intensity[intensity_cols], on='filename', how='left')
 
     for i in range(1, n_populations + 1):
-        area_col = f'normalized_area_percent_{i}'
+        #area fraction of population i from the clustering; per-peak column only in pass-through mode
+        area_col = f'normalized_area_percent_pop{i}'
+        if area_col not in sls_data.columns:
+            area_col = f'normalized_area_percent_{i}'
         if area_col in sls_data.columns:
             sls_data[f'I_pop{i} [kHz]'] = (
                 sls_data['MeanCR_corr [kHz]'] * sls_data[area_col] / 100
