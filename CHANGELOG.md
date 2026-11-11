@@ -1,5 +1,76 @@
 # CHANGELOG
 
+## v3.1.0
+
+bugfix release
+
+### preprocessing.py
+
+- Added corrected_intensity(): mean count rate of both detectors, normalised to the monitor diode and multiplied by sin(theta). Used by the notebook's intensity cell and by subtract_solvent().
+
+---
+
+### regularized.py
+
+- nnls_reg(): overlapping peaks are merged. Neighbouring maxima whose segments each contain the other maximum count as one peak (the highest is kept, the shared area is counted once).
+- nnls_reg(): per-peak kurtosis is now mu4/sigma^4 (Gaussian = 3) instead of the excess kurtosis. Skewness and kurtosis are NaN for peaks with zero width or too few points (previously 0).
+- nnls(), nnls_reg(): R_squared is the weighted R² when the fit is weighted (via weighting.fit_r_squared()); the separate weighted_R_squared field is removed.
+- nnls(), nnls_reg(): residual and Q-Q panels show the weighted residuals for weighted fits; axis labels "lag-time index", "weighted residuals"/"residuals", "theoretical quantiles", "sample quantiles".
+- nnls_reg_all(): raises a RuntimeError with the first error if the fit fails for every dataset (previously an empty table).
+- Peak areas use np.trapezoid (NumPy >= 2.0) and fall back to np.trapz on NumPy 1.x.
+
+---
+
+### cumulants.py
+
+- extract_cumulants() (Method A): now also extracts mu3 of the ALV 3rd-order cumulant block (new column 3rd order frequency exp param3 [ms^3]).
+- plot_processed_correlations() (Method B): Gamma_error and Gamma_relative_error are now computed for weighted fits (standard error of the weighted slope; previously NaN). R² via weighting.fit_r_squared(). Residual and Q-Q panels show the weighted residuals for weighted fits; axis labels as in regularized.py.
+- analyze_diffusion_coefficient(): with fit_through_origin=True, R² is the uncentered R².
+
+---
+
+### cumulants_C.py
+
+- plot_processed_correlations_iterative() (Method C): RMSE and AIC columns removed (best_RMSE, best_AIC, RMSE_iterN, AIC_iterN). R² via weighting.fit_r_squared(). Residual and Q-Q panels show the weighted residuals for weighted fits; axis labels as in regularized.py.
+
+---
+
+### cumulants_D.py
+
+- calculate_moments_from_gammas(): kurtosis is now mu4/mu2^2 (Gaussian = 3) instead of the excess kurtosis, as in Method C. Skewness and kurtosis are NaN for a single mode (previously 0).
+- fit_cumulant_D(): the weighted residual sum used to select the number of modes is stored as fit_ss.
+- fit_correlations_method_D(): R-squared is the weighted R² when the fit is weighted. Residual and Q-Q panels show the weighted residuals for weighted fits; axis labels as in regularized.py.
+- Docstrings fixed: the gap threshold is a linear ratio Gamma(i+1)/Gamma(i); the number of modes is not selected by AIC.
+
+---
+
+### clustering.py
+
+- cluster_all_gammas(): populations are numbered by ascending hydrodynamic radius (pop1 = smallest particles); previously by the Ward cluster labels.
+- cluster_all_gammas(): population statistics in cluster_info are computed from the final assignment (after the silhouette refinement or the removal of uncertain points).
+- cluster_all_gammas(): populations that fall below min_abundance through the refinement are kept and listed in cluster_info['below_min_abundance']. Re-clustering after removing uncertain points applies min_abundance.
+- cluster_all_gammas(): added zscore_threshold and silhouette_uncertainty_threshold (both fall back to uncertainty_threshold).
+- cluster_all_gammas(): population_D_means and population_D_stds are always present in cluster_info.
+- cluster_all_gammas(): outlier_popN and uncertain_popN are created with object dtype (pandas >= 3).
+- _hierarchical_clustering(): a single valid point returns one cluster instead of raising an error.
+- aggregate_peak_stats(): pass-through mode uses ddof=0 for the standard deviation, as the rest of the module.
+- Docstring of the silhouette refinement fixed (single-pass reassignment, no merging).
+
+---
+
+### sls_functions_for_regularized.py
+
+- Added subtract_solvent(): optional subtraction of the mean solvent intensity per angle from every sample run.
+- compute_sls_data(): uses the area fraction of the clustered population (normalized_area_percent_popN) instead of the peak number in each file; per-peak columns only in pass-through mode.
+
+---
+
+### weighting.py
+
+- Added fit_r_squared(): R² shared by all fitting methods, weighted when weights are given.
+
+
+
 ## v3.0.0
 
 alongside the new weighting feature, intensity.py is retired and merged into preprocessing.py
